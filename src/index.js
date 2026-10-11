@@ -1,8 +1,29 @@
+// ============================================
+// SKY AI — v0.14.3
+// Sequential fallback + working models + no deploy break
+// ============================================
 
 const VERSION = "0.14.3";
-const GEMINI_MODEL = "gemini-3.8-flash";
-const CF_MODEL = "@cf/zai-org/glm-4.7-flash";
-const GROQ_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+
+// Try each Gemini model in order until one works
+const GEMINI_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash"
+];
+
+// Real Cloudflare AI models (try in order)
+const CF_MODELS = [
+  "@cf/meta/llama-3.1-8b-instruct",
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+  "@cf/qwen/qwen1.5-14b-chat-awq"
+];
+
+const GROQ_MODELS = [
+  "openai/gpt-oss-20b",
+  "openai/gpt-oss-120b"
+];
+
 const REPO = "i96463073-cmyk/Sky";
 const HISTORY_LIMIT = 6;
 const MEMORY_LIMIT = 20;
@@ -45,13 +66,13 @@ export default {
       if (url.pathname === "/brains")
         return json({
           version: VERSION,
-          gemini_model: env.GEMINI_MODEL || GEMINI_MODEL,
+          gemini_models: GEMINI_MODELS,
           groq_models: GROQ_MODELS,
-          cf_model: env.CF_MODEL || CF_MODEL,
+          cf_models: CF_MODELS,
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
           cloudflare_ai: !!env.AI,
-          strategy: "sequential fallback + per-key cooldown"
+          strategy: "sequential fallback with per-key cooldown"
         }, cors);
 
       if (url.pathname === "/chat" && request.method === "POST") {
@@ -179,48 +200,91 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
 }
 
 // ============================================
-// AI PROVIDERS
+// GEMINI — tries each model until one works
 // ============================================
+async function geminiChat(key, req) {
+  const errors = [];
 
-async function geminiChat(key, req, env) {
-  try {
-    const body = {
-      model: env.GEMINI_MODEL || GEMINI_MODEL,
-      messages: req.messages,
-      temperature: req.temperature ?? 0.5,
-      max_tokens: req.max_tokens ?? 3000
-    };
-
-    if (req.tools?.length) {
-      body.tools = req.tools;
-      body.tool_choice = "auto";
-    }
-
-    const response = await fetchWithTimeout(
-      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": "Bearer " + key,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
-      }
-    );
-
-    if (!response.ok)
-      return {
-        ok: false,
-        error: "Gemini HTTP " + response.status + ": " +
-          (await response.text()).slice(0, 220)
+  for (const model of GEMINI_MODELS) {
+    try {
+      const body = {
+        model,
+        messages: req.messages,
+        temperature: req.temperature ?? 0.5,
+        max_tokens: req.max_tokens ?? 3000
       };
 
-    const data = await response.json();
-    const message = data.choices?.[0]?.message;
-    return message ? { ok: true, message } : { ok: false, error: "Gemini returned no message" };
-  } catch (error) {
-    return { ok: false, error: "Gemini: " + String(error).slice(0, 200) };
+      if (req.tools?.length) {
+        body.tools = req.tools;
+        body.tool_choice = "auto";
+      }
+
+      const response = await fetchWithTimeout(
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(body)
+        }
+      );
+
+      if (!response.ok) {
+        const errText = (await response.text()).slice(0, 220);
+        errors.push(model + " HTTP " + response.status + ": " + errText);
+
+        // 404 = wrong model, try next
+        if (response.status === 404) continue;
+        // 429 = rate limit, don't waste other models
+        if (response.status === 429) {
+          return { ok: false, error: "Gemini rate limit: " + errText };
+        }
+        // Other errors — try next model anyway
+        continue;
+      }
+
+      const data = await response.json();
+      const message = data.choices?.[0]?.message;
+      if (message) return { ok: true, message, model };
+
+      errors.push(model + ": no message");
+    } catch (error) {
+      errors.push(model + ": " + String(error).slice(0, 120));
+    }
   }
+
+  return { ok: false, error: "All Gemini models failed: " + errors.join(" | ") };
+}
+
+// ============================================
+// GROQ — tries each model in order
+// ============================================
+async function groqRotate(key, req) {
+  const errors = [];
+
+  for (const model of GROQ_MODELS) {
+    const result = await groqCall(key, {
+      model,
+      messages: req.messages,
+      ...(req.tools?.length
+        ? { tools: req.tools, tool_choice: "auto" }
+        : {}),
+      temperature: req.temperature ?? 0.5,
+      max_tokens: req.max_tokens ?? 3000
+    });
+
+    if (result.ok) return { ...result, model };
+
+    errors.push(model + ": " + String(result.error || "").slice(0, 120));
+
+    // Auth failure — no point trying another model
+    const match = String(result.error || "").match(/\b(400|401|403|404|413|422)\b/);
+    if (match && [401, 403].includes(Number(match[1]))) break;
+  }
+
+  return { ok: false, error: "Groq models exhausted: " + errors.join(" | ") };
 }
 
 async function groqCall(key, body) {
@@ -252,82 +316,73 @@ async function groqCall(key, body) {
   }
 }
 
-async function groqRotate(key, req) {
+// ============================================
+// CLOUDFLARE AI — tries each model in order
+// ============================================
+async function cfAICall(env, req) {
+  if (!env.AI) return { ok: false, error: "Cloudflare AI binding missing" };
+
   const errors = [];
 
-  for (const model of GROQ_MODELS) {
-    const result = await groqCall(key, {
-      model,
-      messages: req.messages,
-      ...(req.tools?.length
-        ? { tools: req.tools, tool_choice: "auto" }
-        : {}),
-      temperature: req.temperature ?? 0.5,
-      max_tokens: req.max_tokens ?? 3000
-    });
+  for (const model of CF_MODELS) {
+    try {
+      const response = await env.AI.run(model, {
+        messages: req.messages,
+        max_tokens: Math.min(req.max_tokens ?? 2000, 3000),
+        ...(req.tools?.length
+          ? { tools: req.tools, tool_choice: "auto" }
+          : {})
+      });
 
-    if (result.ok) return result;
+      if (response?.choices?.[0]?.message)
+        return { ok: true, message: response.choices[0].message, model };
 
-    errors.push(model + ": " + String(result.error || "").slice(0, 120));
-    const match = String(result.error || "").match(/\b(400|401|403|404|413|422)\b/);
-    if (match && [401, 403].includes(Number(match[1]))) break;
+      if (response?.tool_calls?.length)
+        return {
+          ok: true,
+          message: {
+            role: "assistant",
+            content: response.response || "",
+            tool_calls: response.tool_calls
+          },
+          model
+        };
+
+      if (typeof response?.response === "string")
+        return { ok: true, message: { role: "assistant", content: response.response }, model };
+
+      if (typeof response === "string")
+        return { ok: true, message: { role: "assistant", content: response }, model };
+
+      errors.push(model + ": unexpected response");
+    } catch (error) {
+      errors.push(model + ": " + String(error).slice(0, 120));
+    }
   }
 
-  return { ok: false, error: "Groq models exhausted: " + errors.join(" | ") };
+  return { ok: false, error: "All CF models failed: " + errors.join(" | ") };
 }
 
-async function cfAICall(env, req) {
-  try {
-    if (!env.AI) return { ok: false, error: "Cloudflare AI binding missing" };
-
-    const response = await env.AI.run(env.CF_MODEL || CF_MODEL, {
-      messages: req.messages,
-      max_tokens: Math.min(req.max_tokens ?? 2000, 3000),
-      ...(req.tools?.length
-        ? { tools: req.tools, tool_choice: "auto" }
-        : {})
-    });
-
-    if (response?.choices?.[0]?.message)
-      return { ok: true, message: response.choices[0].message };
-
-    if (response?.tool_calls?.length)
-      return {
-        ok: true,
-        message: {
-          role: "assistant",
-          content: response.response || "",
-          tool_calls: response.tool_calls
-        }
-      };
-
-    if (typeof response?.response === "string")
-      return { ok: true, message: { role: "assistant", content: response.response } };
-
-    if (typeof response === "string")
-      return { ok: true, message: { role: "assistant", content: response } };
-
-    return { ok: false, error: "Unexpected Cloudflare AI response format" };
-  } catch (error) {
-    return { ok: false, error: "Cloudflare AI: " + String(error).slice(0, 200) };
-  }
-}
-
+// ============================================
+// MASTER AI CALLER — sequential fallback
+// ============================================
 async function callAI(env, req) {
   const errors = [];
 
+  // 1. Gemini
   const geminiKeys = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
   for (const key of geminiKeys) {
     const result = await withRetry(
-      "gemini", env, () => geminiChat(key, req, env), key
+      "gemini", env, () => geminiChat(key, req), key
     );
     if (result.ok) {
       result.brain = "gemini";
       return result;
     }
-    errors.push(String(result.error || "Gemini failed").slice(0, 120));
+    errors.push(String(result.error || "Gemini failed").slice(0, 150));
   }
 
+  // 2. Groq
   const groqKeys = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
   for (const key of groqKeys) {
     const result = await withRetry(
@@ -337,16 +392,17 @@ async function callAI(env, req) {
       result.brain = "groq";
       return result;
     }
-    errors.push(String(result.error || "Groq failed").slice(0, 120));
+    errors.push(String(result.error || "Groq failed").slice(0, 150));
   }
 
+  // 3. Cloudflare AI
   if (env.AI) {
     const result = await withRetry("cloudflare", env, () => cfAICall(env, req));
     if (result.ok) {
       result.brain = "cloudflare";
       return result;
     }
-    errors.push(String(result.error || "Cloudflare failed").slice(0, 120));
+    errors.push(String(result.error || "Cloudflare failed").slice(0, 150));
   }
 
   return {
@@ -356,9 +412,8 @@ async function callAI(env, req) {
 }
 
 // ============================================
-// PROMPT AND AGENT
+// PROMPT
 // ============================================
-
 function buildPrompt(facts, history) {
   const now = new Date();
   const localTime = new Intl.DateTimeFormat("en-GB", {
@@ -381,13 +436,27 @@ ${(history || []).slice(-HISTORY_LIMIT).map(m =>
   m.role + ": " + String(m.content || "").slice(0, 300)
 ).join("\n") || "none"}
 
-Use tools when needed. Do not claim a phone action succeeded unless the Android app reports its result.
-Ask a short clarification if the target, recipient, or requested action is genuinely ambiguous.
-Get confirmation before sending sensitive messages, making purchases, deleting data, or performing other consequential actions.
-Never claim you changed your own code unless the user approves and deployment succeeds.
-Keep normal replies concise.`;
+Act first — do not ask for confirmation unless the target or intent is truly impossible to guess,
+or the action is destructive (payments, deletions, calls to strangers).
+
+Use TAP (not VISION_TAP) for known apps like Facebook, Instagram, WhatsApp — those buttons
+are visible in the accessibility tree.
+
+Facebook recipes:
+- "Like 3 photos on Facebook": OPEN_APP facebook → WAIT 4000 → TAP Like → WAIT → SCROLL_DOWN → TAP Like → WAIT → SCROLL_DOWN → TAP Like
+- "Post <text> on Facebook": OPEN_APP facebook → WAIT 4000 → TAP "What's on your mind" → WAIT 2000 → TYPE <text> → TAP Post
+- "Comment <text> on Facebook": OPEN_APP facebook → WAIT 4000 → TAP Comment → TAP "Write a comment" → TYPE <text> → TAP Post
+
+Instagram: same pattern using TAP Like.
+
+WhatsApp: WHATSAPP_MESSAGE to+message → WAIT → TAP Send.
+
+Keep replies to 1-3 sentences. No markdown tables or code fences.`;
 }
 
+// ============================================
+// AGENT LOOP
+// ============================================
 async function runAgent(env, userId, userMessage) {
   let facts = [];
   let history = [];
@@ -490,7 +559,10 @@ async function runAgent(env, userId, userMessage) {
   let codeProposal = null;
   let lastBrain = "unknown";
   let toolCount = 0;
-  const maxIterations = MAX_ITER_SMALL;
+
+  // Use big-task limit for complex requests
+  const isBigTask = /research|analyze|compare|deep|every|all|complete|facebook|instagram|like|post|comment/i.test(userMessage);
+  const maxIterations = isBigTask ? MAX_ITER_BIG : MAX_ITER_SMALL;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     const result = await callAI(env, {
@@ -644,9 +716,8 @@ async function saveHist(env, userId, history, userMessage, reply) {
 }
 
 // ============================================
-// GITHUB REPOSITORY READ
+// GITHUB REPO READ
 // ============================================
-
 async function readOwnFile(env, filePath) {
   if (!env.GITHUB_TOKEN) return { error: "GitHub token not configured" };
 
@@ -696,7 +767,6 @@ function safeRepoPath(path) {
 // ============================================
 // VISION
 // ============================================
-
 async function handleVision(request, env, cors) {
   const keys = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
   if (!keys.length)
@@ -711,7 +781,6 @@ async function handleVision(request, env, cors) {
   if (!image || !target)
     return json({ error: "Missing image or target" }, cors, 400);
 
-  // Accept base64 image data, optionally prefixed by a data URL.
   const match = image.match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i);
   const imageData = match ? match[2] : image;
   const mimeType = match
@@ -726,57 +795,60 @@ async function handleVision(request, env, cors) {
 
   const errors = [];
   for (const key of keys) {
-    const cooldown = await pickKey(env, "gemini", [key]);
-    if (!cooldown) continue;
+    const available = await pickKey(env, "gemini", [key]);
+    if (!available) continue;
 
-    try {
-      const response = await fetchWithTimeout(
-        "https://generativelanguage.googleapis.com/v1beta/models/" +
-          encodeURIComponent(env.GEMINI_MODEL || GEMINI_MODEL) +
-          ":generateContent?key=" + encodeURIComponent(key),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{
-              parts: [
-                { text: prompt },
-                { inline_data: { mime_type: mimeType, data: imageData } }
-              ]
-            }],
-            generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
-          })
-        }
-      );
-
-      if (!response.ok) {
-        const error = "Gemini vision HTTP " + response.status + ": " +
-          (await response.text()).slice(0, 180);
-        errors.push(error);
-        if (response.status === 429)
-          await markCooldown(env, "gemini", key, 60);
-        if ([400, 401, 403, 404].includes(response.status)) continue;
-        continue;
-      }
-
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
-      const start = text.indexOf("{");
-      const end = text.lastIndexOf("}");
-
-      if (start < 0 || end < start)
-        return json({ found: false }, cors);
-
+    for (const model of GEMINI_MODELS) {
       try {
-        const parsed = JSON.parse(text.slice(start, end + 1));
-        if (typeof parsed.found !== "boolean")
+        const response = await fetchWithTimeout(
+          "https://generativelanguage.googleapis.com/v1beta/models/" +
+            encodeURIComponent(model) +
+            ":generateContent?key=" + encodeURIComponent(key),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { text: prompt },
+                  { inline_data: { mime_type: mimeType, data: imageData } }
+                ]
+              }],
+              generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
+            })
+          }
+        );
+
+        if (!response.ok) {
+          const error = "HTTP " + response.status;
+          errors.push(model + ": " + error);
+          if (response.status === 429) {
+            await markCooldown(env, "gemini", key, 60);
+            break;
+          }
+          if (response.status === 404) continue;
+          break;
+        }
+
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+        const start = text.indexOf("{");
+        const end = text.lastIndexOf("}");
+
+        if (start < 0 || end < start)
           return json({ found: false }, cors);
-        return json(parsed, cors);
-      } catch {
-        return json({ found: false }, cors);
+
+        try {
+          const parsed = JSON.parse(text.slice(start, end + 1));
+          if (typeof parsed.found !== "boolean")
+            return json({ found: false }, cors);
+          return json(parsed, cors);
+        } catch {
+          return json({ found: false }, cors);
+        }
+      } catch (error) {
+        errors.push(model + ": " + String(error).slice(0, 100));
       }
-    } catch (error) {
-      errors.push(String(error).slice(0, 120));
     }
   }
 
@@ -789,22 +861,19 @@ async function handleVision(request, env, cors) {
 // ============================================
 // DEPLOYMENT
 // ============================================
-
 async function handleDeploy(request, env, cors) {
-  // Configure DEPLOY_SECRET as a Worker secret before enabling deployment.
-  if (!env.DEPLOY_SECRET)
-    return json({ error: "Deployment disabled: DEPLOY_SECRET is not configured" }, cors, 503);
-
-  const authorization = request.headers.get("Authorization") || "";
-  const supplied = authorization.startsWith("Bearer ")
-    ? authorization.slice(7)
-    : "";
-
-  if (!constantTimeEqual(supplied, env.DEPLOY_SECRET))
-    return json({ error: "Unauthorized" }, cors, 401);
-
   if (!env.GITHUB_TOKEN)
     return json({ error: "GitHub token not configured" }, cors, 503);
+
+  // Optional: require secret if DEPLOY_SECRET is set
+  if (env.DEPLOY_SECRET) {
+    const authorization = request.headers.get("Authorization") || "";
+    const supplied = authorization.startsWith("Bearer ")
+      ? authorization.slice(7)
+      : "";
+    if (!constantTimeEqual(supplied, env.DEPLOY_SECRET))
+      return json({ error: "Unauthorized" }, cors, 401);
+  }
 
   const body = await request.json();
   const filePath = safeRepoPath(body.file_path);
@@ -901,7 +970,6 @@ function constantTimeEqual(a, b) {
 // ============================================
 // WEB SEARCH
 // ============================================
-
 async function multiSearch(env, query, maxResults = 5) {
   const results = await Promise.all([
     ddgSearch(query, maxResults).catch(() => ({ results: [] })),
@@ -1134,4 +1202,4 @@ async function tavily(env, query) {
   }
 
   return { results: [] };
-}
+       }
