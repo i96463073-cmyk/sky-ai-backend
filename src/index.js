@@ -1,14 +1,14 @@
 // ============================================
-// SKY AI — v0.13.0
-// Multi-source search + persistent tasks + parallel racing
+// SKY AI — v0.13.1
+// Action recipes + act-first prompt
 // ============================================
 
 const GROQ_MODEL = "openai/gpt-oss-20b";
 const GROQ_FALLBACK = "openai/gpt-oss-120b";
 const GEMINI_MODEL = "gemini-2.0-flash";
 const CF_MODEL = "@cf/meta/llama-3.1-8b-instruct";
-const MAX_ITER_SMALL = 8;
-const MAX_ITER_BIG = 20;
+const MAX_ITER_SMALL = 10;
+const MAX_ITER_BIG = 25;
 const HISTORY_LIMIT = 6;
 const MEMORY_LIMIT = 20;
 const REPO = "i96463073-cmyk/Sky";
@@ -27,11 +27,11 @@ export default {
       return new Response(null, { status: 204, headers: cors });
 
     if (url.pathname === "/")
-      return json({ service: "Sky AI", version: "0.13.0", status: "online" }, cors);
+      return json({ service: "Sky AI", version: "0.13.1", status: "online" }, cors);
 
     if (url.pathname === "/brains")
       return json({
-        version: "0.13.0",
+        version: "0.13.1",
         brains: {
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
@@ -42,12 +42,12 @@ export default {
           memory: !!env.SKY_MEMORY,
           github: !!env.GITHUB_TOKEN
         },
-        strategy: "multi-source search + persistent tasks + parallel racing"
+        strategy: "act-first + action recipes + parallel racing"
       }, cors);
 
     if (url.pathname === "/health")
       return json({
-        ok: true, service: "Sky AI", version: "0.13.0",
+        ok: true, service: "Sky AI", version: "0.13.1",
         gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
         groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
         cf_ai: !!env.AI,
@@ -339,7 +339,7 @@ function isBigTask(req) {
   const lastUser = [...req.messages].reverse().find(m => m.role === "user");
   if (lastUser) {
     const text = String(lastUser.content || "").toLowerCase();
-    if (/research|analyze|analyse|explain deeply|compare|deep dive|investigate|every|all|complete/.test(text)) {
+    if (/research|analyze|analyse|explain deeply|compare|deep dive|investigate|every|all|complete|facebook|instagram|like|post|comment|tweet/.test(text)) {
       return true;
     }
   }
@@ -347,7 +347,7 @@ function isBigTask(req) {
 }
 
 // ============================================
-// RACING (parallel brains)
+// RACING
 // ============================================
 async function raceBrains(env, req) {
   const attempts = [];
@@ -386,9 +386,6 @@ async function raceBrains(env, req) {
   }
 }
 
-// ============================================
-// SEQUENTIAL (small tasks)
-// ============================================
 async function callAI(env, req) {
   if (isBigTask(req)) return await raceBrains(env, req);
 
@@ -429,7 +426,7 @@ async function callAI(env, req) {
 }
 
 // ============================================
-// MULTI-SOURCE SEARCH — parallel
+// MULTI-SOURCE SEARCH
 // ============================================
 async function multiSearch(env, query, maxResults) {
   const [ddg, bing, wiki, tav] = await Promise.all([
@@ -465,38 +462,25 @@ async function multiSearch(env, query, maxResults) {
   addAll(wiki, "wikipedia");
   addAll(tav, "tavily");
 
-  return {
-    query: query,
-    count: all.length,
-    sources: sources,
-    results: all.slice(0, maxResults)
-  };
+  return { query, count: all.length, sources, results: all.slice(0, maxResults) };
 }
 
-// ============================================
-// DUCKDUCKGO
-// ============================================
 async function ddgSearch(query, numResults = 5) {
   const ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-
   try {
     const formData = new URLSearchParams();
     formData.append("q", query);
     const response = await fetch("https://html.duckduckgo.com/html/", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": ua
-      },
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": ua },
       body: formData.toString()
     });
     if (response.ok) {
       const html = await response.text();
       const results = parseDDG(html, numResults);
-      if (results.length > 0) return { results: results, source: "ddg" };
+      if (results.length > 0) return { results, source: "ddg" };
     }
   } catch (e) {}
-
   try {
     const response = await fetch(
       "https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(query),
@@ -505,10 +489,9 @@ async function ddgSearch(query, numResults = 5) {
     if (response.ok) {
       const html = await response.text();
       const results = parseDDGLite(html, numResults);
-      if (results.length > 0) return { results: results, source: "ddg-lite" };
+      if (results.length > 0) return { results, source: "ddg-lite" };
     }
   } catch (e) {}
-
   return { results: [] };
 }
 
@@ -526,9 +509,7 @@ function parseDDG(html, numResults) {
         if (redirectMatch) { try { url = decodeURIComponent(redirectMatch[1]); } catch (e) {} }
         const title = stripTags(linkMatch[2]).trim();
         const snippet = snippetMatch ? stripTags(snippetMatch[1]).trim() : "";
-        if (url.startsWith("http") && title.length > 0) {
-          results.push({ title, url, snippet });
-        }
+        if (url.startsWith("http") && title.length > 0) results.push({ title, url, snippet });
       }
     }
   } catch (e) {}
@@ -542,45 +523,30 @@ function parseDDGLite(html, numResults) {
     const snippetRegex = /<td[^>]*class="result-snippet"[^>]*>(.*?)<\/td>/gs;
     const links = [];
     let m;
-    while ((m = linkRegex.exec(html)) !== null) {
-      links.push({ url: m[1], title: stripTags(m[2]).trim() });
-    }
+    while ((m = linkRegex.exec(html)) !== null) links.push({ url: m[1], title: stripTags(m[2]).trim() });
     const snippets = [];
-    while ((m = snippetRegex.exec(html)) !== null) {
-      snippets.push(stripTags(m[1]).trim());
-    }
+    while ((m = snippetRegex.exec(html)) !== null) snippets.push(stripTags(m[1]).trim());
     for (let i = 0; i < links.length && results.length < numResults; i++) {
       let url = links[i].url;
       const rd = url.match(/uddg=([^&]+)/);
       if (rd) { try { url = decodeURIComponent(rd[1]); } catch (e) {} }
-      if (url.startsWith("http") && links[i].title.length > 0) {
+      if (url.startsWith("http") && links[i].title.length > 0)
         results.push({ title: links[i].title, url, snippet: snippets[i] || "" });
-      }
     }
   } catch (e) {}
   return results;
 }
 
-// ============================================
-// BING (HTML scrape)
-// ============================================
 async function bingSearch(query, numResults = 5) {
   try {
     const response = await fetch(
       "https://www.bing.com/search?q=" + encodeURIComponent(query) + "&count=" + numResults,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
-          "Accept-Language": "en-US,en;q=0.9"
-        }
-      }
+      { headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36", "Accept-Language": "en-US,en;q=0.9" } }
     );
     if (!response.ok) return { results: [] };
-
     const html = await response.text();
     const results = [];
     const blocks = html.split(/<li class="b_algo"/);
-
     for (let i = 1; i < blocks.length && results.length < numResults; i++) {
       const block = blocks[i];
       const linkMatch = block.match(/<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/s);
@@ -589,9 +555,7 @@ async function bingSearch(query, numResults = 5) {
         const url = linkMatch[1];
         const title = stripTags(linkMatch[2]).trim();
         const snippet = snippetMatch ? stripTags(snippetMatch[1]).trim() : "";
-        if (url.startsWith("http") && title.length > 0) {
-          results.push({ title, url, snippet });
-        }
+        if (url.startsWith("http") && title.length > 0) results.push({ title, url, snippet });
       }
     }
     return { results };
@@ -600,20 +564,12 @@ async function bingSearch(query, numResults = 5) {
   }
 }
 
-// ============================================
-// WIKIPEDIA
-// ============================================
 async function wikiSearch(query) {
   try {
-    const url = "https://en.wikipedia.org/w/api.php?" +
-      "action=query&list=search&srsearch=" + encodeURIComponent(query) +
-      "&format=json&srlimit=3&srprop=snippet";
-
-    const response = await fetch(url, {
-      headers: { "User-Agent": "SkyAI/0.13 (phone assistant)" }
-    });
+    const url = "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" +
+      encodeURIComponent(query) + "&format=json&srlimit=3&srprop=snippet";
+    const response = await fetch(url, { headers: { "User-Agent": "SkyAI/0.13" } });
     if (!response.ok) return { results: [] };
-
     const data = await response.json();
     const results = [];
     for (const item of (data.query?.search || [])) {
@@ -632,37 +588,24 @@ async function wikiSearch(query) {
 function stripTags(s) {
   return String(s)
     .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#x27;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/\.\.\./g, "…")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"").replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/\.\.\./g, "…").replace(/\s+/g, " ").trim();
 }
 
-// ============================================
-// FETCH PAGE
-// ============================================
 async function fetchPageText(url) {
   try {
     const response = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
-      },
+      headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36" },
       redirect: "follow"
     });
     if (!response.ok) return { error: "HTTP " + response.status };
     const ct = response.headers.get("content-type") || "";
-    if (!ct.includes("text/html") && !ct.includes("text/plain")) {
-      return { error: "Not HTML" };
-    }
+    if (!ct.includes("text/html") && !ct.includes("text/plain")) return { error: "Not HTML" };
     const html = await response.text();
     const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/is);
     const title = titleMatch ? stripTags(titleMatch[1]) : "";
-
     let body = html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -671,57 +614,31 @@ async function fetchPageText(url) {
       .replace(/<header[\s\S]*?<\/header>/gi, " ")
       .replace(/<aside[\s\S]*?<\/aside>/gi, " ")
       .replace(/<!--[\s\S]*?-->/g, " ");
-
     let text = "";
     const paras = body.match(/<(p|h1|h2|h3|h4|h5|h6|li)[^>]*>([\s\S]*?)<\/\1>/gi) || [];
-    if (paras.length > 0) {
-      text = paras.map(m => stripTags(m)).join(" ");
-    } else {
-      text = stripTags(body);
-    }
+    if (paras.length > 0) text = paras.map(m => stripTags(m)).join(" ");
+    else text = stripTags(body);
     text = text.replace(/\s+/g, " ").trim();
-
     return { url, title, text: text.slice(0, 6000), length: text.length };
   } catch (e) {
     return { error: String(e).slice(0, 200) };
   }
 }
 
-// ============================================
-// DEEP RESEARCH
-// ============================================
 async function deepResearch(env, query, maxPages = 3) {
   const search = await multiSearch(env, query, 6);
-  if (!search.results || search.results.length === 0) {
-    return { error: "No results from any source", pages: [] };
-  }
-
+  if (!search.results || search.results.length === 0) return { error: "No results", pages: [] };
   const pages = [];
   for (let i = 0; i < Math.min(search.results.length, maxPages); i++) {
     const r = search.results[i];
     const page = await fetchPageText(r.url);
     if (!page.error && page.text && page.text.length > 200) {
-      pages.push({
-        url: r.url,
-        title: page.title || r.title,
-        source: r.source,
-        text: page.text.slice(0, 1500)
-      });
+      pages.push({ url: r.url, title: page.title || r.title, source: r.source, text: page.text.slice(0, 1500) });
     }
   }
-
-  return {
-    query,
-    sources_used: search.sources,
-    search_results: search.results,
-    pages,
-    pages_read: pages.length
-  };
+  return { query, sources_used: search.sources, search_results: search.results, pages, pages_read: pages.length };
 }
 
-// ============================================
-// TAVILY
-// ============================================
 async function tavily(env, query) {
   const keys = getKeys(env.TAVILY_API_KEYS, env.TAVILY_API_KEY);
   if (!keys.length) return { results: [] };
@@ -731,10 +648,7 @@ async function tavily(env, query) {
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: key, query, search_depth: "basic",
-        include_answer: true, max_results: 5
-      })
+      body: JSON.stringify({ api_key: key, query, search_depth: "basic", include_answer: true, max_results: 5 })
     });
     if (!res.ok) {
       await markCooldown(env, "tavily", key);
@@ -753,7 +667,7 @@ async function tavily(env, query) {
 }
 
 // ============================================
-// SYSTEM PROMPT
+// SYSTEM PROMPT — ACT FIRST, ASK NEVER
 // ============================================
 function buildPrompt(facts, history) {
   const now = new Date();
@@ -767,7 +681,7 @@ function buildPrompt(facts, history) {
     ? history.slice(-HISTORY_LIMIT).map(m => m.role[0].toUpperCase() + ":" + m.content.slice(0, 80)).join("\n")
     : "none";
 
-  return `You are Sky — an autonomous Android AI phone agent that NEVER gives up on a task.
+  return `You are Sky — an autonomous Android AI agent. You EXECUTE. You do NOT stall.
 
 Time (Africa/Nairobi): ${eat}
 UTC: ${now.toUTCString()}
@@ -776,37 +690,106 @@ User memory: ${mem}
 Recent:
 ${hist}
 
-═══ NEVER LEAVE WORK IN THE MIDDLE ═══
+═══════════════════════════════════════════
+⚡ ACT-FIRST PRINCIPLE (CRITICAL)
+═══════════════════════════════════════════
 
-When you start a task, FINISH it. This means:
+NEVER ask "which one?" "could you clarify?" "do you want me to?"
+UNLESS the request is truly impossible to guess.
 
-1. If a search returns nothing, TRY A DIFFERENT SOURCE (you have DDG, Bing, Wikipedia, Tavily).
-2. If a brain fails, the Worker will automatically retry with a different brain — just keep going.
-3. If a page won't load, try the next result.
-4. If you don't understand the request, ask ONE short clarifying question.
-5. Complete ALL steps of multi-step tasks before replying.
-6. NEVER say "I ran out of steps" — if you hit the limit, summarize progress and continue next message.
+If the user says "like the first 3 photos on Facebook":
+→ Act. Open Facebook. Tap the first 3 Like buttons.
+→ Do NOT ask "which Facebook? which photos?"
 
-═══ EFFICIENCY (YOU'RE ON FREE TIERS) ═══
+If the user says "call that number on WhatsApp":
+→ Open WhatsApp with that number. Type a message or start the call.
+→ Do NOT ask "what should I say?"
 
-- Prefer direct answers over searches when you know the fact.
-- Use ONE search per question, not five.
-- Read 2 pages max per research task.
-- Use remember() to save facts — saves tokens later.
-- Keep replies 1-3 sentences.
-- No markdown tables, no code fences.
+If the user says "post good morning":
+→ Post "good morning".
+→ Do NOT ask "on which platform?"
 
-═══ TOOLS ═══
+Only ask ONE question if the request is genuinely ambiguous AND action would be destructive (payments, calls to strangers, deletions).
 
-1. web_search(query) - Multi-source search (DDG + Bing + Wikipedia + Tavily in parallel)
-2. read_url(url) - Read a specific page
-3. research(topic) - Deep research (search + read top pages)
-4. phone_action(action_type, ...) - Control the phone
-5. remember(fact) - Save permanent facts
-6. read_own_file(file_path) - Read Sky's own code
-7. propose_code_change(file_path, summary, new_content) - Propose code changes
+═══════════════════════════════════════════
+FACEBOOK ACTION RECIPES
+═══════════════════════════════════════════
 
-PHONE ACTIONS:
+When user asks to LIKE posts on Facebook, emit these actions IN ORDER:
+
+1. phone_action OPEN_APP "facebook"
+2. phone_action WAIT 3000
+3. VISION_TAP target "Like button of the first post"
+4. phone_action SCROLL_DOWN
+5. phone_action WAIT 1500
+6. VISION_TAP target "Like button of the next post"
+7. phone_action SCROLL_DOWN
+8. phone_action WAIT 1500
+9. VISION_TAP target "Like button of the next post"
+10. reply: "Liked 3 posts."
+
+When user asks to POST on Facebook:
+1. phone_action OPEN_APP "facebook"
+2. phone_action WAIT 3000
+3. VISION_TAP target "What's on your mind box"
+4. phone_action WAIT 1500
+5. phone_action TYPE "<the text>"
+6. phone_action WAIT 1000
+7. VISION_TAP target "Post button"
+8. reply: "Posted."
+
+When user asks to COMMENT on a Facebook post:
+1. phone_action OPEN_APP "facebook"
+2. phone_action WAIT 3000
+3. VISION_TAP target "Comment button of the first post"
+4. phone_action WAIT 1500
+5. VISION_TAP target "Write a comment text box"
+6. phone_action TYPE "<comment text>"
+7. phone_action WAIT 1000
+8. VISION_TAP target "Post comment button"
+9. reply: "Commented."
+
+═══════════════════════════════════════════
+INSTAGRAM ACTION RECIPES
+═══════════════════════════════════════════
+
+Like 3 posts:
+1. OPEN_APP "instagram"
+2. WAIT 3000
+3. VISION_TAP target "Heart icon on first post"
+4. SCROLL_DOWN, WAIT 1500
+5. VISION_TAP target "Heart icon"
+6. SCROLL_DOWN, WAIT 1500
+7. VISION_TAP target "Heart icon"
+
+═══════════════════════════════════════════
+WHATSAPP ACTION RECIPES
+═══════════════════════════════════════════
+
+"Call that number on WhatsApp":
+1. phone_action WHATSAPP_MESSAGE to:"<number>" message:""
+2. WAIT 2000
+3. reply "WhatsApp is open with that contact."
+
+"Send <name> a WhatsApp saying <text>":
+1. phone_action WHATSAPP_MESSAGE to:"<name or number>" message:"<text>"
+2. WAIT 2500
+3. VISION_TAP target "Send button"
+4. reply "Message sent."
+
+═══════════════════════════════════════════
+TOOLS
+═══════════════════════════════════════════
+
+web_search(query) - Multi-source search
+read_url(url) - Read a page
+research(topic) - Deep research
+phone_action(action_type, ...) - Control the phone
+remember(fact) - Save permanent facts
+read_own_file(file_path) - Read Sky's code
+propose_code_change(file_path, summary, new_content) - Propose code changes
+
+PHONE ACTION TYPES:
 OPEN_APP(query), SEARCH_WEB(query), WHATSAPP_MESSAGE(to,message),
 SEND_SMS(to,message), TAP(target), VISION_TAP(target), TYPE(text),
 READ_SCREEN, READ_SCREEN_VISION, GO_BACK, GO_HOME, SCROLL_DOWN,
@@ -817,7 +800,18 @@ REPO FILES:
 - app/src/main/java/com/sky/agent/SkyWakeService.kt
 - app/src/main/java/com/sky/agent/SkyAccessibilityService.kt
 - app/src/main/AndroidManifest.xml
-- app/src/main/res/layout/activity_main.xml`;
+- app/src/main/res/layout/activity_main.xml
+
+═══════════════════════════════════════════
+EFFICIENCY (FREE TIERS)
+═══════════════════════════════════════════
+
+- Prefer direct answers over searches when you know the fact.
+- One search per question, not five.
+- 2 pages max per research.
+- remember() to save facts.
+- Keep replies 1-3 sentences.
+- No markdown tables, no code fences.`;
 }
 
 // ============================================
@@ -858,17 +852,17 @@ async function runAgent(env, userId, userMessage) {
     }},
     { type: "function", function: {
       name: "read_url",
-      description: "Read a specific page when you need deeper content.",
+      description: "Read a specific page.",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] }
     }},
     { type: "function", function: {
       name: "research",
-      description: "Deep multi-source research. Use for 'tell me about X' or complex topics.",
+      description: "Deep multi-source research.",
       parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] }
     }},
     { type: "function", function: {
       name: "phone_action",
-      description: "Perform an action on the phone.",
+      description: "Perform an action on the phone. Chain MANY calls in one response for multi-step tasks.",
       parameters: { type: "object", properties: {
         action_type: { type: "string", enum: [
           "OPEN_APP","SEARCH_WEB","WHATSAPP_MESSAGE","SEND_SMS",
@@ -1010,9 +1004,6 @@ async function runAgent(env, userId, userMessage) {
   };
 }
 
-// ============================================
-// READ OWN FILE
-// ============================================
 async function readOwnFile(env, filePath) {
   if (!env.GITHUB_TOKEN) return { error: "No GitHub token" };
   if (!filePath) return { error: "No file path" };
@@ -1041,9 +1032,6 @@ async function readOwnFile(env, filePath) {
   }
 }
 
-// ============================================
-// SAVE HISTORY
-// ============================================
 async function saveHist(env, userId, history, u, r) {
   if (!env.SKY_MEMORY) return;
   try {
