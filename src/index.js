@@ -1,60 +1,16 @@
-// ============================================
-// SKY AI — v0.14.2
-// Correct models + retry logic + full action support
-// ============================================
 
-const GEMINI_MODEL = "gemini-2.0-flash";
-const CF_MODEL = "@cf/meta/llama-3.1-8b-instruct";
-const MAX_ITER_SMALL = 10;
-const MAX_ITER_BIG = 25;
+const VERSION = "0.14.3";
+const GEMINI_MODEL = "gemini-3.8-flash";
+const CF_MODEL = "@cf/zai-org/glm-4.7-flash";
+const GROQ_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
+const REPO = "i96463073-cmyk/Sky";
 const HISTORY_LIMIT = 6;
 const MEMORY_LIMIT = 20;
-const REPO = "i96463073-cmyk/Sky";
+const MAX_TOOL_CALLS_PER_TURN = 12;
+const MAX_ITER_SMALL = 8;
+const MAX_ITER_BIG = 16;
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// ============================================
-// RESILIENT CALL WRAPPER
-// ============================================
-async function withRetry(name, env, fn) {
-  if (env.SKY_MEMORY) {
-    const cd = await env.SKY_MEMORY.get("cooldown:v2:" + name);
-    if (cd) return { ok: false, error: name + " cooling down" };
-  }
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const result = await fn();
-      if (result && result.ok) return result;
-
-      const err = String(result?.error || "");
-
-      if (/40[134]/.test(err) || /not found|decommission|invalid|does not exist/i.test(err)) {
-        return result;
-      }
-
-      if (/429|rate limit/i.test(err)) {
-        if (env.SKY_MEMORY) {
-          await env.SKY_MEMORY.put("cooldown:v2:" + name, "1", { expirationTtl: 60 });
-        }
-        return result;
-      }
-
-      if (attempt === 0) {
-        await sleep(500);
-        continue;
-      }
-      return result;
-    } catch (e) {
-      if (attempt === 0) {
-        await sleep(500);
-        continue;
-      }
-      return { ok: false, error: String(e).slice(0, 200) };
-    }
-  }
-  return { ok: false, error: name + " failed after retries" };
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export default {
   async fetch(request, env) {
@@ -69,827 +25,982 @@ export default {
     if (request.method === "OPTIONS")
       return new Response(null, { status: 204, headers: cors });
 
-    if (url.pathname === "/")
-      return json({ service: "Sky AI", version: "0.14.2", status: "online" }, cors);
+    try {
+      if (url.pathname === "/")
+        return json({ service: "Sky AI", version: VERSION, status: "online" }, cors);
 
-    if (url.pathname === "/brains")
-      return json({
-        version: "0.14.2",
-        brains: {
+      if (url.pathname === "/health")
+        return json({
+          ok: true,
+          service: "Sky AI",
+          version: VERSION,
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
-          cloudflare_ai: !!env.AI
-        },
-        gemini_model: GEMINI_MODEL,
-        groq_models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
-        cf_model: CF_MODEL,
-        strategy: "retry + cooldown + racing"
-      }, cors);
+          cloudflare_ai: !!env.AI,
+          memory: !!env.SKY_MEMORY,
+          github: !!env.GITHUB_TOKEN,
+          now: new Date().toISOString()
+        }, cors);
 
-    if (url.pathname === "/health")
-      return json({
-        ok: true, service: "Sky AI", version: "0.14.2",
-        gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
-        groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
-        cf_ai: !!env.AI,
-        memory: !!env.SKY_MEMORY,
-        github: !!env.GITHUB_TOKEN,
-        now: new Date().toISOString()
-      }, cors);
+      if (url.pathname === "/brains")
+        return json({
+          version: VERSION,
+          gemini_model: env.GEMINI_MODEL || GEMINI_MODEL,
+          groq_models: GROQ_MODELS,
+          cf_model: env.CF_MODEL || CF_MODEL,
+          gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
+          groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
+          cloudflare_ai: !!env.AI,
+          strategy: "sequential fallback + per-key cooldown"
+        }, cors);
 
-    if (url.pathname === "/chat" && request.method === "POST") {
-      try {
+      if (url.pathname === "/chat" && request.method === "POST") {
         const body = await request.json();
         const message = String(body.message || "").trim();
         if (!message) return json({ error: "Missing message" }, cors, 400);
+
         const ip = request.headers.get("cf-connecting-ip") || "unknown";
         const userId = "u_" + hash(ip);
-        const result = await runAgent(env, userId, message);
-        return json(result, cors);
-      } catch (e) {
-        return json({ reply: "Crash: " + String(e).slice(0, 150), action: null }, cors);
+        return json(await runAgent(env, userId, message), cors);
       }
+
+      if (url.pathname === "/vision" && request.method === "POST")
+        return await handleVision(request, env, cors);
+
+      if (url.pathname === "/deploy" && request.method === "POST")
+        return await handleDeploy(request, env, cors);
+
+      return json({ error: "Not found" }, cors, 404);
+    } catch (error) {
+      return json({
+        error: String(error).slice(0, 250),
+        reply: "The request failed. Check the backend logs and try again.",
+        action: null
+      }, cors, 500);
     }
-
-    if (url.pathname === "/vision" && request.method === "POST") {
-      try {
-        const geminiKeys = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
-        if (!geminiKeys.length) return json({ error: "No Gemini keys" }, cors, 500);
-        const body = await request.json();
-        const image = String(body.image || "").trim();
-        const target = String(body.target || "").trim();
-        const screenW = Number(body.width || 1080);
-        const screenH = Number(body.height || 2400);
-        if (!image || !target) return json({ error: "Missing fields" }, cors, 400);
-
-        const prompt =
-          "Phone screenshot " + screenW + "x" + screenH + " pixels. " +
-          "Find UI element matching: \"" + target + "\". " +
-          "Reply ONLY valid JSON: " +
-          "{\"found\": true, \"x\": 540, \"y\": 1200, \"label\": \"...\"} " +
-          "or {\"found\": false}.";
-
-        const key = await pickKey(env, "gemini", geminiKeys);
-        if (!key) return json({ error: "All Gemini keys cooling" }, cors, 503);
-
-        const gemRes = await fetch(
-          "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL +
-          ":generateContent?key=" + key,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [
-                { text: prompt },
-                { inline_data: { mime_type: "image/jpeg", data: image } }
-              ]}],
-              generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
-            })
-          }
-        );
-
-        if (!gemRes.ok) {
-          await markCooldown(env, "gemini", key);
-          return json({ error: "Gemini " + gemRes.status }, cors, 502);
-        }
-        const gemData = await gemRes.json();
-        const text = (gemData.candidates?.[0]?.content?.parts?.[0]?.text) || "";
-        let parsed;
-        try {
-          const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
-          parsed = JSON.parse(cleaned.slice(cleaned.indexOf("{"), cleaned.lastIndexOf("}") + 1));
-        } catch (e) {
-          parsed = { found: false };
-        }
-        return json(parsed, cors);
-      } catch (e) {
-        return json({ error: String(e).slice(0, 200) }, cors, 500);
-      }
-    }
-
-    if (url.pathname === "/deploy" && request.method === "POST") {
-      try {
-        if (!env.GITHUB_TOKEN) return json({ error: "No GitHub token" }, cors, 500);
-        const body = await request.json();
-        const filePath = String(body.file_path || "").trim();
-        const content = String(body.new_content || "");
-        const commitMsg = String(body.commit_message || "SkyAI: auto-update").trim();
-        if (!filePath || !content) return json({ error: "Missing fields" }, cors, 400);
-
-        const today = new Date().toISOString().slice(0, 10);
-        const rateKey = "deploys:" + today;
-        let count = 0;
-        if (env.SKY_MEMORY) {
-          const v = await env.SKY_MEMORY.get(rateKey);
-          count = v ? parseInt(v) : 0;
-        }
-        if (count >= 10) return json({ error: "Daily limit" }, cors, 429);
-
-        const apiUrl = "https://api.github.com/repos/" + REPO + "/contents/" + filePath;
-        const getRes = await fetch(apiUrl, {
-          headers: { "Authorization": "Bearer " + env.GITHUB_TOKEN, "Accept": "application/vnd.github+json", "User-Agent": "SkyAI" }
-        });
-        let sha = null;
-        if (getRes.ok) {
-          const gd = await getRes.json();
-          sha = gd.sha;
-        }
-
-        const encoded = btoa(unescape(encodeURIComponent(content)));
-        const putBody = { message: commitMsg, content: encoded, branch: "main" };
-        if (sha) putBody.sha = sha;
-
-        const putRes = await fetch(apiUrl, {
-          method: "PUT",
-          headers: { "Authorization": "Bearer " + env.GITHUB_TOKEN, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": "SkyAI" },
-          body: JSON.stringify(putBody)
-        });
-
-        if (!putRes.ok) return json({ error: "GitHub " + putRes.status }, cors, 502);
-        const putJson = await putRes.json();
-        if (env.SKY_MEMORY) await env.SKY_MEMORY.put(rateKey, String(count + 1), { expirationTtl: 86400 });
-        return json({ ok: true, commit: putJson.commit?.sha }, cors);
-      } catch (e) {
-        return json({ error: String(e).slice(0, 200) }, cors, 500);
-      }
-    }
-
-    return json({ error: "Not found" }, cors, 404);
   }
 };
 
-function json(d, cors, status = 200) {
-  return new Response(JSON.stringify(d), { status, headers: cors });
+function json(data, headers, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
-function hash(s) {
+function hash(value) {
   let h = 0;
-  for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h &= h; }
+  for (let i = 0; i < String(value).length; i++) {
+    h = ((h << 5) - h) + String(value).charCodeAt(i);
+    h |= 0;
+  }
   return Math.abs(h).toString(36);
 }
 
 function getKeys(plural, singular) {
-  const raw = (plural || "").trim();
-  if (raw) return raw.split(",").map(k => k.trim()).filter(k => k.length > 0);
-  if (singular) return [singular];
-  return [];
+  const raw = String(plural || "").trim();
+  if (raw) return [...new Set(raw.split(",").map(k => k.trim()).filter(Boolean))];
+  return singular ? [String(singular).trim()].filter(Boolean) : [];
 }
 
 async function pickKey(env, provider, keys) {
-  if (!keys || keys.length === 0) return null;
-  if (!env.SKY_MEMORY) return keys[0];
-  for (const key of keys) {
-    const cooldownKey = "cooldown:" + provider + ":" + hash(key);
-    const val = await env.SKY_MEMORY.get(cooldownKey);
-    if (!val) return key;
+  for (const key of keys || []) {
+    if (!env.SKY_MEMORY) return key;
+    try {
+      const cooldown = await env.SKY_MEMORY.get("cooldown:" + provider + ":" + hash(key));
+      if (!cooldown) return key;
+    } catch {
+      return key;
+    }
   }
   return null;
 }
 
-async function markCooldown(env, provider, key) {
-  if (!env.SKY_MEMORY) return;
-  const cooldownKey = "cooldown:" + provider + ":" + hash(key);
-  await env.SKY_MEMORY.put(cooldownKey, "1", { expirationTtl: 60 });
+async function markCooldown(env, provider, key, seconds = 60) {
+  if (!env.SKY_MEMORY || !key) return;
+  try {
+    await env.SKY_MEMORY.put(
+      "cooldown:" + provider + ":" + hash(key),
+      "1",
+      { expirationTtl: Math.max(30, Math.min(seconds, 900)) }
+    );
+  } catch {}
+}
+
+async function withRetry(provider, env, fn, key = null) {
+  const cooldownKey = key
+    ? "cooldown:" + provider + ":" + hash(key)
+    : null;
+
+  if (cooldownKey && env.SKY_MEMORY) {
+    try {
+      if (await env.SKY_MEMORY.get(cooldownKey))
+        return { ok: false, error: provider + " key cooling down" };
+    } catch {}
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await fn();
+      if (result?.ok) return result;
+
+      const error = String(result?.error || "Provider failed");
+      const match = error.match(/\b(400|401|403|404|408|413|422|429|500|502|503|504)\b/);
+      const status = match ? Number(match[1]) : 0;
+
+      if ([400, 401, 403, 404, 413, 422].includes(status)) return result;
+
+      if (status === 429 || /rate.?limit|too many requests/i.test(error)) {
+        if (key) await markCooldown(env, provider, key, 60);
+        return result;
+      }
+
+      if (attempt === 0) {
+        await sleep(350);
+        continue;
+      }
+      return result || { ok: false, error };
+    } catch (error) {
+      if (attempt === 0) {
+        await sleep(350);
+        continue;
+      }
+      return { ok: false, error: String(error).slice(0, 250) };
+    }
+  }
+  return { ok: false, error: provider + " failed after retries" };
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ============================================
-// GEMINI CALL
+// AI PROVIDERS
 // ============================================
-async function geminiChat(key, req) {
+
+async function geminiChat(key, req, env) {
   try {
     const body = {
-      model: GEMINI_MODEL,
+      model: env.GEMINI_MODEL || GEMINI_MODEL,
       messages: req.messages,
-      temperature: req.temperature || 0.5,
-      max_tokens: req.max_tokens || 4000
+      temperature: req.temperature ?? 0.5,
+      max_tokens: req.max_tokens ?? 3000
     };
-    if (req.tools && req.tools.length > 0) {
+
+    if (req.tools?.length) {
       body.tools = req.tools;
       body.tool_choice = "auto";
     }
-    const res = await fetch(
+
+    const response = await fetchWithTimeout(
       "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
       {
         method: "POST",
-        headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
+        headers: {
+          "Authorization": "Bearer " + key,
+          "Content-Type": "application/json"
+        },
         body: JSON.stringify(body)
       }
     );
-    if (!res.ok) {
-      const t = await res.text();
-      return { ok: false, error: "Gemini " + res.status + ": " + t.slice(0, 200) };
-    }
-    const data = await res.json();
-    const msg = data.choices?.[0]?.message;
-    if (!msg) return { ok: false, error: "No message" };
-    return { ok: true, message: msg };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-}
 
-// ============================================
-// GROQ CALL (only 2 working models)
-// ============================================
-async function groqRotate(key, req) {
-  const models = [
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b"
-  ];
-  let lastErr = "no groq models";
-  for (const m of models) {
-    const r = await groqCall(key, {
-      model: m,
-      messages: req.messages,
-      tools: req.tools,
-      tool_choice: "auto",
-      temperature: req.temperature || 0.5,
-      max_tokens: req.max_tokens || 4000
-    });
-    if (r.ok) return r;
-    lastErr = m + ": " + String(r.error || "").slice(0, 120);
-    if (r.error && !r.error.toLowerCase().includes("rate")) {
-      return { ok: false, error: lastErr };
-    }
+    if (!response.ok)
+      return {
+        ok: false,
+        error: "Gemini HTTP " + response.status + ": " +
+          (await response.text()).slice(0, 220)
+      };
+
+    const data = await response.json();
+    const message = data.choices?.[0]?.message;
+    return message ? { ok: true, message } : { ok: false, error: "Gemini returned no message" };
+  } catch (error) {
+    return { ok: false, error: "Gemini: " + String(error).slice(0, 200) };
   }
-  return { ok: false, error: "Groq rate-limited. " + lastErr };
 }
 
 async function groqCall(key, body) {
   try {
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      const t = await res.text();
-      return { ok: false, error: t.slice(0, 300) };
-    }
-    const data = await res.json();
-    const msg = data.choices?.[0]?.message;
-    if (!msg) return { ok: false, error: "No message" };
-    return { ok: true, message: msg };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-}
-
-// ============================================
-// CLOUDFLARE AI
-// ============================================
-async function cfAICall(ai, req) {
-  try {
-    const cfBody = {
-      messages: req.messages,
-      max_tokens: Math.min(req.max_tokens || 2000, 3000)
-    };
-    if (req.tools && req.tools.length > 0) cfBody.tools = req.tools;
-
-    const response = await ai.run(CF_MODEL, cfBody);
-    let msg = { role: "assistant", content: "" };
-    if (response && response.tool_calls && response.tool_calls.length > 0) {
-      msg.tool_calls = response.tool_calls;
-      msg.content = response.response || "";
-    } else if (response && response.response) {
-      msg.content = response.response;
-    } else if (typeof response === "string") {
-      msg.content = response;
-    } else {
-      msg.content = JSON.stringify(response).slice(0, 500);
-    }
-    return { ok: true, message: msg };
-  } catch (e) {
-    return { ok: false, error: String(e).slice(0, 200) };
-  }
-}
-
-// ============================================
-// TASK SIZING
-// ============================================
-function isBigTask(req) {
-  let totalChars = 0;
-  for (const m of req.messages) {
-    if (m.content) totalChars += String(m.content).length;
-  }
-  if (totalChars > 3500) return true;
-  const lastUser = [...req.messages].reverse().find(m => m.role === "user");
-  if (lastUser) {
-    const text = String(lastUser.content || "").toLowerCase();
-    if (/research|analyze|compare|deep|every|all|complete|facebook|instagram|like|post|comment/.test(text)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// ============================================
-// RACING BRAINS (parallel)
-// ============================================
-async function raceBrains(env, req) {
-  const attempts = [];
-
-  const gk = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
-  if (gk.length) {
-    const k = await pickKey(env, "gemini", gk);
-    if (k) attempts.push(
-      withRetry("gemini", env, () => geminiChat(k, req)).then(r => {
-        if (!r.ok) return Promise.reject("g:" + String(r.error).slice(0, 80));
-        r.brain = "gemini";
-        return r;
-      })
+    const response = await fetchWithTimeout(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + key,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      }
     );
-  }
 
-  const gqk = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
-  if (gqk.length) {
-    const k = await pickKey(env, "groq", gqk);
-    if (k) attempts.push(
-      withRetry("groq", env, () => groqRotate(k, req)).then(r => {
-        if (!r.ok) return Promise.reject("q:" + String(r.error).slice(0, 80));
-        r.brain = "groq";
-        return r;
-      })
-    );
-  }
+    if (!response.ok)
+      return {
+        ok: false,
+        error: "Groq HTTP " + response.status + ": " +
+          (await response.text()).slice(0, 220)
+      };
 
-  if (env.AI) attempts.push(
-    withRetry("cloudflare", env, () => cfAICall(env.AI, req)).then(r => {
-      if (!r.ok) return Promise.reject("c:" + String(r.error).slice(0, 80));
-      r.brain = "cloudflare";
-      return r;
-    })
-  );
-
-  if (attempts.length === 0) return { ok: false, error: "no brains configured" };
-  try {
-    return await Promise.any(attempts);
-  } catch (e) {
-    return { ok: false, error: "BRAINS FAILED → " + (e.errors ? e.errors.join(" | ") : String(e)) };
+    const data = await response.json();
+    const message = data.choices?.[0]?.message;
+    return message ? { ok: true, message } : { ok: false, error: "Groq returned no message" };
+  } catch (error) {
+    return { ok: false, error: "Groq: " + String(error).slice(0, 200) };
   }
 }
 
-// ============================================
-// SEQUENTIAL (small tasks)
-// ============================================
-async function callAI(env, req) {
-  if (isBigTask(req)) return await raceBrains(env, req);
-
+async function groqRotate(key, req) {
   const errors = [];
 
-  const gk = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
-  if (gk.length) {
-    const k = await pickKey(env, "gemini", gk);
-    if (k) {
-      const r = await withRetry("gemini", env, () => geminiChat(k, req));
-      if (r.ok) { r.brain = "gemini"; return r; }
-      errors.push("gemini");
-    }
+  for (const model of GROQ_MODELS) {
+    const result = await groqCall(key, {
+      model,
+      messages: req.messages,
+      ...(req.tools?.length
+        ? { tools: req.tools, tool_choice: "auto" }
+        : {}),
+      temperature: req.temperature ?? 0.5,
+      max_tokens: req.max_tokens ?? 3000
+    });
+
+    if (result.ok) return result;
+
+    errors.push(model + ": " + String(result.error || "").slice(0, 120));
+    const match = String(result.error || "").match(/\b(400|401|403|404|413|422)\b/);
+    if (match && [401, 403].includes(Number(match[1]))) break;
   }
 
-  const gqk = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
-  if (gqk.length) {
-    const k = await pickKey(env, "groq", gqk);
-    if (k) {
-      const r = await withRetry("groq", env, () => groqRotate(k, req));
-      if (r.ok) { r.brain = "groq"; return r; }
-      errors.push("groq");
+  return { ok: false, error: "Groq models exhausted: " + errors.join(" | ") };
+}
+
+async function cfAICall(env, req) {
+  try {
+    if (!env.AI) return { ok: false, error: "Cloudflare AI binding missing" };
+
+    const response = await env.AI.run(env.CF_MODEL || CF_MODEL, {
+      messages: req.messages,
+      max_tokens: Math.min(req.max_tokens ?? 2000, 3000),
+      ...(req.tools?.length
+        ? { tools: req.tools, tool_choice: "auto" }
+        : {})
+    });
+
+    if (response?.choices?.[0]?.message)
+      return { ok: true, message: response.choices[0].message };
+
+    if (response?.tool_calls?.length)
+      return {
+        ok: true,
+        message: {
+          role: "assistant",
+          content: response.response || "",
+          tool_calls: response.tool_calls
+        }
+      };
+
+    if (typeof response?.response === "string")
+      return { ok: true, message: { role: "assistant", content: response.response } };
+
+    if (typeof response === "string")
+      return { ok: true, message: { role: "assistant", content: response } };
+
+    return { ok: false, error: "Unexpected Cloudflare AI response format" };
+  } catch (error) {
+    return { ok: false, error: "Cloudflare AI: " + String(error).slice(0, 200) };
+  }
+}
+
+async function callAI(env, req) {
+  const errors = [];
+
+  const geminiKeys = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
+  for (const key of geminiKeys) {
+    const result = await withRetry(
+      "gemini", env, () => geminiChat(key, req, env), key
+    );
+    if (result.ok) {
+      result.brain = "gemini";
+      return result;
     }
+    errors.push(String(result.error || "Gemini failed").slice(0, 120));
+  }
+
+  const groqKeys = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
+  for (const key of groqKeys) {
+    const result = await withRetry(
+      "groq", env, () => groqRotate(key, req), key
+    );
+    if (result.ok) {
+      result.brain = "groq";
+      return result;
+    }
+    errors.push(String(result.error || "Groq failed").slice(0, 120));
   }
 
   if (env.AI) {
-    const r = await withRetry("cloudflare", env, () => cfAICall(env.AI, req));
-    if (r.ok) { r.brain = "cloudflare"; return r; }
-    errors.push("cloudflare");
+    const result = await withRetry("cloudflare", env, () => cfAICall(env, req));
+    if (result.ok) {
+      result.brain = "cloudflare";
+      return result;
+    }
+    errors.push(String(result.error || "Cloudflare failed").slice(0, 120));
   }
 
-  return { ok: false, error: "BRAINS FAILED → " + (errors.join(" | ") || "none configured") };
+  return {
+    ok: false,
+    error: "All AI providers failed: " + (errors.join(" | ") || "No providers configured")
+  };
 }
 
 // ============================================
-// SYSTEM PROMPT
+// PROMPT AND AGENT
 // ============================================
+
 function buildPrompt(facts, history) {
   const now = new Date();
-  const eat = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Africa/Nairobi", weekday: "short", year: "numeric",
-    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false
+  const localTime = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Nairobi",
+    weekday: "short",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
   }).format(now);
 
-  const mem = (facts && facts.length) ? facts.slice(-MEMORY_LIMIT).join("; ") : "none";
-  const hist = (history && history.length)
-    ? history.slice(-HISTORY_LIMIT).map(m => m.role[0].toUpperCase() + ":" + m.content.slice(0, 80)).join("\n")
-    : "none";
+  return `You are Sky, an Android AI assistant that can use tools.
 
-  return `You are Sky — an autonomous Android AI agent. You EXECUTE.
+Kenya time: ${localTime}
+Memory: ${(facts || []).slice(-MEMORY_LIMIT).join("; ") || "none"}
+Recent conversation:
+${(history || []).slice(-HISTORY_LIMIT).map(m =>
+  m.role + ": " + String(m.content || "").slice(0, 300)
+).join("\n") || "none"}
 
-Time (Africa/Nairobi): ${eat}
-UTC: ${now.toUTCString()}
-
-User memory: ${mem}
-Recent:
-${hist}
-
-═══ ACT FIRST — NEVER ASK FOR CLARIFICATION ═══
-
-If user says "like the first 3 photos on Facebook":
-→ Do it. Open Facebook. Tap Like buttons via TAP action.
-
-Only ask if IMPOSSIBLE to guess OR destructive.
-
-═══ USE TAP (not VISION_TAP) FOR KNOWN APPS ═══
-
-TAP finds buttons by accessibility text — fast, reliable, no screenshots.
-VISION_TAP is only fallback when TAP fails.
-
-Facebook: Like="Like", comment="Comment", post="Post", composer="What's on your mind"
-Instagram: like="Like", comment="Comment"
-WhatsApp: send="Send"
-
-═══ FACEBOOK RECIPES ═══
-
-"Like 3 posts on Facebook":
-1. OPEN_APP query:"facebook"
-2. WAIT ms:4000
-3. TAP target:"Like"
-4. WAIT ms:1000
-5. SCROLL_DOWN
-6. WAIT ms:1500
-7. TAP target:"Like"
-8. WAIT ms:1000
-9. SCROLL_DOWN
-10. WAIT ms:1500
-11. TAP target:"Like"
-
-"Post on Facebook <text>":
-1. OPEN_APP query:"facebook"
-2. WAIT ms:4000
-3. TAP target:"What's on your mind"
-4. WAIT ms:2000
-5. TYPE text:"<text>"
-6. WAIT ms:1000
-7. TAP target:"Post"
-
-"Comment on Facebook <text>":
-1. OPEN_APP query:"facebook"
-2. WAIT ms:4000
-3. TAP target:"Comment"
-4. WAIT ms:1500
-5. TAP target:"Write a comment"
-6. TYPE text:"<text>"
-7. TAP target:"Post"
-
-═══ INSTAGRAM ═══
-
-"Like 3 photos on Instagram":
-1. OPEN_APP query:"instagram"
-2. WAIT ms:4000
-3. TAP target:"Like"
-4. SCROLL_DOWN, WAIT 1500
-5. TAP target:"Like"
-6. SCROLL_DOWN, WAIT 1500
-7. TAP target:"Like"
-
-═══ WHATSAPP ═══
-
-"Send <text> to <number>":
-1. WHATSAPP_MESSAGE to:"<number>" message:"<text>"
-2. WAIT ms:2500
-3. TAP target:"Send"
-
-═══ TOOLS ═══
-
-web_search, read_url, research, phone_action, remember,
-read_own_file, propose_code_change
-
-PHONE ACTIONS:
-OPEN_APP(query), SEARCH_WEB(query), WHATSAPP_MESSAGE(to,message),
-SEND_SMS(to,message), TAP(target), VISION_TAP(target), TYPE(text),
-READ_SCREEN, READ_SCREEN_VISION, GO_BACK, GO_HOME, SCROLL_DOWN,
-SCROLL_UP, WAIT(ms)
-
-REPO FILES:
-- app/src/main/java/com/sky/agent/MainActivity.kt (TOO BIG)
-- app/src/main/java/com/sky/agent/SkyWakeService.kt
-- app/src/main/java/com/sky/agent/SkyAccessibilityService.kt
-- app/src/main/AndroidManifest.xml
-- app/src/main/res/layout/activity_main.xml
-
-RULES:
-- Keep replies 1-3 sentences.
-- No markdown tables or code fences.`;
+Use tools when needed. Do not claim a phone action succeeded unless the Android app reports its result.
+Ask a short clarification if the target, recipient, or requested action is genuinely ambiguous.
+Get confirmation before sending sensitive messages, making purchases, deleting data, or performing other consequential actions.
+Never claim you changed your own code unless the user approves and deployment succeeds.
+Keep normal replies concise.`;
 }
 
-// ============================================
-// AGENT LOOP
-// ============================================
 async function runAgent(env, userId, userMessage) {
   let facts = [];
   let history = [];
+
   if (env.SKY_MEMORY) {
-    try { const f = await env.SKY_MEMORY.get(userId + ":facts"); if (f) facts = JSON.parse(f); } catch {}
-    try { const h = await env.SKY_MEMORY.get(userId + ":history"); if (h) history = JSON.parse(h); } catch {}
+    try {
+      facts = JSON.parse(await env.SKY_MEMORY.get(userId + ":facts") || "[]");
+      history = JSON.parse(await env.SKY_MEMORY.get(userId + ":history") || "[]");
+    } catch {}
   }
 
   if (/^(remember|note)[: ]/i.test(userMessage)) {
     const fact = userMessage.replace(/^(remember|note)[: ]/i, "").trim();
     if (fact) {
       facts.push(fact);
-      if (facts.length > MEMORY_LIMIT) facts = facts.slice(-MEMORY_LIMIT);
-      if (env.SKY_MEMORY) await env.SKY_MEMORY.put(userId + ":facts", JSON.stringify(facts));
-      return { reply: "Got it.", action: null };
+      facts = facts.slice(-MEMORY_LIMIT);
+      if (env.SKY_MEMORY)
+        await env.SKY_MEMORY.put(userId + ":facts", JSON.stringify(facts));
+      return { reply: "Got it. I'll remember that.", action: null, actions: [] };
     }
   }
-  if (/^forget everything/i.test(userMessage)) {
-    if (env.SKY_MEMORY) await env.SKY_MEMORY.put(userId + ":facts", JSON.stringify([]));
-    return { reply: "Memories cleared.", action: null };
-  }
 
-  const messages = [
-    { role: "system", content: buildPrompt(facts, history) },
-    { role: "user", content: userMessage }
-  ];
+  if (/^forget everything/i.test(userMessage)) {
+    if (env.SKY_MEMORY)
+      await env.SKY_MEMORY.put(userId + ":facts", "[]");
+    return { reply: "Saved memories cleared.", action: null, actions: [] };
+  }
 
   const tools = [
     { type: "function", function: {
       name: "web_search",
-      description: "Multi-source search.",
+      description: "Search the web for current information.",
       parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
     }},
     { type: "function", function: {
       name: "read_url",
-      description: "Read a page.",
+      description: "Read public webpage text.",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] }
     }},
     { type: "function", function: {
       name: "research",
-      description: "Deep research.",
+      description: "Search and read several pages about a topic.",
       parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] }
     }},
     { type: "function", function: {
       name: "phone_action",
-      description: "Perform a phone action. Chain many calls in one response.",
-      parameters: { type: "object", properties: {
-        action_type: { type: "string", enum: [
-          "OPEN_APP","SEARCH_WEB","WHATSAPP_MESSAGE","SEND_SMS",
-          "TAP","VISION_TAP","TYPE","READ_SCREEN","READ_SCREEN_VISION",
-          "GO_BACK","GO_HOME","SCROLL_DOWN","SCROLL_UP","WAIT"
-        ]},
-        query: { type: "string" }, to: { type: "string" },
-        message: { type: "string" }, target: { type: "string" },
-        text: { type: "string" }, ms: { type: "number" },
-        say: { type: "string" }
-      }, required: ["action_type","say"] }
+      description: "Queue a supported action for the connected Android app to execute.",
+      parameters: {
+        type: "object",
+        properties: {
+          action_type: {
+            type: "string",
+            enum: ["OPEN_APP","SEARCH_WEB","WHATSAPP_MESSAGE","SEND_SMS","TAP",
+              "VISION_TAP","TYPE","READ_SCREEN","READ_SCREEN_VISION","GO_BACK",
+              "GO_HOME","SCROLL_DOWN","SCROLL_UP","WAIT"]
+          },
+          query: { type: "string" },
+          to: { type: "string" },
+          message: { type: "string" },
+          target: { type: "string" },
+          text: { type: "string" },
+          ms: { type: "number" },
+          say: { type: "string" }
+        },
+        required: ["action_type", "say"]
+      }
     }},
     { type: "function", function: {
       name: "remember",
-      description: "Save fact.",
+      description: "Save a useful user-approved fact.",
       parameters: { type: "object", properties: { fact: { type: "string" } }, required: ["fact"] }
     }},
     { type: "function", function: {
       name: "read_own_file",
-      description: "Read Sky's code.",
+      description: "Read a file from the Sky GitHub repository.",
       parameters: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] }
     }},
     { type: "function", function: {
       name: "propose_code_change",
-      description: "Propose code change.",
-      parameters: { type: "object", properties: {
-        file_path: { type: "string" }, summary: { type: "string" }, new_content: { type: "string" }
-      }, required: ["file_path","summary","new_content"] }
+      description: "Prepare a code proposal for user review; do not deploy it.",
+      parameters: {
+        type: "object",
+        properties: {
+          file_path: { type: "string" },
+          summary: { type: "string" },
+          new_content: { type: "string" }
+        },
+        required: ["file_path", "summary", "new_content"]
+      }
     }}
   ];
 
-  const allActions = [];
+  const messages = [
+    { role: "system", content: buildPrompt(facts, history) },
+    ...history.slice(-HISTORY_LIMIT),
+    { role: "user", content: userMessage }
+  ];
+
+  const actions = [];
   let codeProposal = null;
-  let iter = 0;
   let lastBrain = "unknown";
+  let toolCount = 0;
+  const maxIterations = MAX_ITER_SMALL;
 
-  const bigTask = isBigTask({ messages });
-  const maxIter = bigTask ? MAX_ITER_BIG : MAX_ITER_SMALL;
-
-  while (iter < maxIter) {
-    iter++;
-    const r = await callAI(env, {
-      messages, tools, temperature: 0.5, max_tokens: 4000
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const result = await callAI(env, {
+      messages,
+      tools,
+      temperature: 0.4,
+      max_tokens: 3000
     });
 
-    if (!r.ok) {
+    if (!result.ok) {
       return {
-        reply: String(r.error || "unknown").slice(0, 400),
-        action: null, actions: allActions, brain: lastBrain
+        reply: String(result.error || "All AI providers failed").slice(0, 400),
+        action: actions[0] || null,
+        actions,
+        code_proposal: codeProposal,
+        brain: lastBrain
       };
     }
 
-    lastBrain = r.brain || "unknown";
-    const msg = r.message;
-    const calls = msg.tool_calls || [];
+    lastBrain = result.brain || "unknown";
+    const message = result.message;
+    const calls = message.tool_calls || [];
 
-    if (calls.length === 0) {
-      const reply = (msg.content || "Okay.").trim();
+    if (!calls.length) {
+      const reply = String(message.content || "Okay.").trim();
       await saveHist(env, userId, history, userMessage, reply);
       return {
-        reply, action: allActions[0] || null, actions: allActions,
-        code_proposal: codeProposal, brain: lastBrain
+        reply,
+        action: actions[0] || null,
+        actions,
+        code_proposal: codeProposal,
+        brain: lastBrain
       };
     }
 
-    messages.push(msg);
+    messages.push({
+      role: "assistant",
+      content: message.content || "",
+      tool_calls: calls
+    });
 
     for (const call of calls) {
-      const name = call.function.name;
-      let a = {};
-      try { a = JSON.parse(call.function.arguments || "{}"); } catch {}
+      if (++toolCount > MAX_TOOL_CALLS_PER_TURN) {
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({ error: "Tool call limit reached" })
+        });
+        continue;
+      }
 
-      let result = {};
+      let args = {};
+      try {
+        args = JSON.parse(call.function?.arguments || "{}");
+      } catch {}
 
-      if (name === "web_search") {
-        result = await multiSearch(env, a.query || userMessage, 5);
-      } else if (name === "read_url") {
-        result = await fetchPageText(a.url);
-      } else if (name === "research") {
-        result = await deepResearch(env, a.topic || userMessage, 3);
-      } else if (name === "phone_action") {
-        const act = { type: a.action_type };
-        if (a.query) act.query = a.query;
-        if (a.to) act.to = a.to;
-        if (a.message) act.message = a.message;
-        if (a.target) act.target = a.target;
-        if (a.text) act.text = a.text;
-        if (typeof a.ms === "number") act.ms = a.ms;
+      const name = call.function?.name;
+      let output = {};
 
-        if (act.type === "OPEN_APP" && (!act.query || !act.query.trim())) {
-          const lower = userMessage.toLowerCase();
-          const known = ["whatsapp","chrome","telegram","youtube","camera",
-                         "instagram","facebook","spotify","gmail","settings"];
-          for (const k of known) if (lower.includes(k)) { act.query = k; break; }
-        }
+      try {
+        if (name === "web_search") {
+          output = await multiSearch(env, String(args.query || userMessage), 5);
+        } else if (name === "read_url") {
+          output = await fetchPageText(String(args.url || ""));
+        } else if (name === "research") {
+          output = await deepResearch(env, String(args.topic || userMessage), 3);
+        } else if (name === "phone_action") {
+          const type = String(args.action_type || "");
+          const allowed = ["OPEN_APP","SEARCH_WEB","WHATSAPP_MESSAGE","SEND_SMS",
+            "TAP","VISION_TAP","TYPE","READ_SCREEN","READ_SCREEN_VISION",
+            "GO_BACK","GO_HOME","SCROLL_DOWN","SCROLL_UP","WAIT"];
 
-        allActions.push(act);
-        result = { queued: true, action: act };
-      } else if (name === "remember") {
-        const f = String(a.fact || "").trim();
-        if (f) {
-          facts.push(f);
-          if (facts.length > MEMORY_LIMIT) facts = facts.slice(-MEMORY_LIMIT);
-          if (env.SKY_MEMORY) await env.SKY_MEMORY.put(userId + ":facts", JSON.stringify(facts));
-        }
-        result = { saved: true };
-      } else if (name === "read_own_file") {
-        result = await readOwnFile(env, String(a.file_path || ""));
-      } else if (name === "propose_code_change") {
-        const content = String(a.new_content || "");
-        const lineCount = content.split("\n").length;
-        if (lineCount > 400) {
-          result = { error: "File too large. Max 400 lines." };
+          if (!allowed.includes(type)) {
+            output = { error: "Unsupported phone action" };
+          } else {
+            const action = { type };
+            for (const field of ["query","to","message","target","text","say"]) {
+              if (typeof args[field] === "string") action[field] = args[field];
+            }
+            if (typeof args.ms === "number")
+              action.ms = Math.max(0, Math.min(args.ms, 10000));
+
+            actions.push(action);
+            output = { queued: true, action };
+          }
+        } else if (name === "remember") {
+          const fact = String(args.fact || "").trim();
+          if (fact) {
+            facts.push(fact);
+            facts = facts.slice(-MEMORY_LIMIT);
+            if (env.SKY_MEMORY)
+              await env.SKY_MEMORY.put(userId + ":facts", JSON.stringify(facts));
+          }
+          output = { saved: !!fact };
+        } else if (name === "read_own_file") {
+          output = await readOwnFile(env, String(args.file_path || ""));
+        } else if (name === "propose_code_change") {
+          const filePath = String(args.file_path || "").trim();
+          const content = String(args.new_content || "");
+          if (!filePath || content.length > 50000) {
+            output = { error: "Invalid path or proposal too large" };
+          } else {
+            codeProposal = {
+              file_path: filePath,
+              summary: String(args.summary || "Code change"),
+              new_content: content
+            };
+            output = { proposed: true, approval_required: true };
+          }
         } else {
-          codeProposal = {
-            file_path: String(a.file_path || ""),
-            summary: String(a.summary || "Code change"),
-            new_content: content
-          };
-          result = { proposed: true };
+          output = { error: "Unknown tool" };
         }
+      } catch (error) {
+        output = { error: String(error).slice(0, 250) };
       }
 
       messages.push({
-        role: "tool", tool_call_id: call.id,
-        content: JSON.stringify(result).slice(0, 12000)
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(output).slice(0, 10000)
       });
     }
   }
 
-  const note = codeProposal
-    ? "Drafted the change. Tap APPROVE."
-    : "Say \"continue\" and I'll finish.";
-  await saveHist(env, userId, history, userMessage, note);
+  const reply = codeProposal
+    ? "I've prepared a code proposal for review. It has not been deployed."
+    : "I've reached the tool-call limit for this turn. You can ask me to continue.";
+
+  await saveHist(env, userId, history, userMessage, reply);
+
   return {
-    reply: note, action: null, actions: allActions,
-    code_proposal: codeProposal, brain: lastBrain, incomplete: true
+    reply,
+    action: actions[0] || null,
+    actions,
+    code_proposal: codeProposal,
+    brain: lastBrain,
+    incomplete: true
   };
 }
 
-async function readOwnFile(env, filePath) {
-  if (!env.GITHUB_TOKEN) return { error: "No token" };
-  if (!filePath) return { error: "No path" };
-  try {
-    const url = "https://api.github.com/repos/" + REPO + "/contents/" + filePath;
-    const res = await fetch(url, {
-      headers: { "Authorization": "Bearer " + env.GITHUB_TOKEN, "Accept": "application/vnd.github+json", "User-Agent": "SkyAI" }
-    });
-    if (!res.ok) return { error: "Not found" };
-    const data = await res.json();
-    const decoded = decodeURIComponent(escape(atob((data.content || "").replace(/\n/g, ""))));
-    const lines = decoded.split("\n");
-    const head = lines.slice(0, 60).join("\n");
-    const tail = lines.length > 120 ? lines.slice(-30).join("\n") : lines.slice(60, 120).join("\n");
-    return { content: "File: " + filePath + "\nLines: " + lines.length + "\n\n" + head + "\n...\n" + tail };
-  } catch (e) {
-    return { error: String(e) };
-  }
-}
-
-async function saveHist(env, userId, history, u, r) {
+async function saveHist(env, userId, history, userMessage, reply) {
   if (!env.SKY_MEMORY) return;
   try {
-    history.push({ role: "user", content: u });
-    history.push({ role: "assistant", content: r });
-    if (history.length > HISTORY_LIMIT) history = history.slice(-HISTORY_LIMIT);
-    await env.SKY_MEMORY.put(userId + ":history", JSON.stringify(history));
+    const updated = [
+      ...history,
+      { role: "user", content: userMessage },
+      { role: "assistant", content: reply }
+    ].slice(-HISTORY_LIMIT);
+    await env.SKY_MEMORY.put(userId + ":history", JSON.stringify(updated));
   } catch {}
 }
 
 // ============================================
-// MULTI-SOURCE SEARCH
+// GITHUB REPOSITORY READ
 // ============================================
-async function multiSearch(env, query, maxResults) {
-  const [ddg, bing, wiki, tav] = await Promise.all([
-    ddgSearch(query, maxResults).catch(e => ({ results: [] })),
-    bingSearch(query, maxResults).catch(e => ({ results: [] })),
-    wikiSearch(query).catch(e => ({ results: [] })),
-    tavily(env, query).catch(e => ({ results: [] }))
-  ]);
 
-  const all = [];
-  const seen = new Set();
-  function addAll(res, name) {
-    for (const r of (res.results || [])) {
-      const url = r.url || "";
-      if (!url || seen.has(url)) continue;
-      seen.add(url);
-      all.push({ title: r.title || "", url, snippet: (r.snippet || "").slice(0, 400), source: name });
+async function readOwnFile(env, filePath) {
+  if (!env.GITHUB_TOKEN) return { error: "GitHub token not configured" };
+
+  const safePath = safeRepoPath(filePath);
+  if (!safePath) return { error: "Invalid repository file path" };
+
+  try {
+    const response = await fetchWithTimeout(
+      "https://api.github.com/repos/" + REPO + "/contents/" +
+        safePath.split("/").map(encodeURIComponent).join("/"),
+      {
+        headers: {
+          "Authorization": "Bearer " + env.GITHUB_TOKEN,
+          "Accept": "application/vnd.github+json",
+          "User-Agent": "SkyAI"
+        }
+      }
+    );
+
+    if (!response.ok)
+      return { error: "GitHub HTTP " + response.status };
+
+    const data = await response.json();
+    const decoded = decodeURIComponent(escape(atob(
+      String(data.content || "").replace(/\n/g, "")
+    )));
+    const lines = decoded.split("\n");
+
+    return {
+      file_path: safePath,
+      line_count: lines.length,
+      content: lines.slice(0, 120).join("\n").slice(0, 12000)
+    };
+  } catch (error) {
+    return { error: String(error).slice(0, 200) };
+  }
+}
+
+function safeRepoPath(path) {
+  const value = String(path || "").trim().replace(/^\/+/, "");
+  if (!value || value.includes("..") || value.includes("\\") ||
+      value.startsWith(".git/") || value.includes("\0")) return null;
+  if (!/^[a-zA-Z0-9._/-]+$/.test(value)) return null;
+  return value;
+}
+
+// ============================================
+// VISION
+// ============================================
+
+async function handleVision(request, env, cors) {
+  const keys = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
+  if (!keys.length)
+    return json({ error: "No Gemini API key configured" }, cors, 503);
+
+  const body = await request.json();
+  const image = String(body.image || "").trim();
+  const target = String(body.target || "").trim();
+  const width = Number(body.width || 1080);
+  const height = Number(body.height || 2400);
+
+  if (!image || !target)
+    return json({ error: "Missing image or target" }, cors, 400);
+
+  // Accept base64 image data, optionally prefixed by a data URL.
+  const match = image.match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i);
+  const imageData = match ? match[2] : image;
+  const mimeType = match
+    ? (match[1].toLowerCase() === "jpg" ? "image/jpeg" :
+       "image/" + match[1].toLowerCase())
+    : "image/jpeg";
+
+  const prompt =
+    `Screenshot dimensions ${width}x${height}. Locate this UI element: "${target}". ` +
+    `Return only JSON with found, x, y, and label. Coordinates must be pixel coordinates ` +
+    `from the top-left. If uncertain, return {"found":false}.`;
+
+  const errors = [];
+  for (const key of keys) {
+    const cooldown = await pickKey(env, "gemini", [key]);
+    if (!cooldown) continue;
+
+    try {
+      const response = await fetchWithTimeout(
+        "https://generativelanguage.googleapis.com/v1beta/models/" +
+          encodeURIComponent(env.GEMINI_MODEL || GEMINI_MODEL) +
+          ":generateContent?key=" + encodeURIComponent(key),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: prompt },
+                { inline_data: { mime_type: mimeType, data: imageData } }
+              ]
+            }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
+          })
+        }
+      );
+
+      if (!response.ok) {
+        const error = "Gemini vision HTTP " + response.status + ": " +
+          (await response.text()).slice(0, 180);
+        errors.push(error);
+        if (response.status === 429)
+          await markCooldown(env, "gemini", key, 60);
+        if ([400, 401, 403, 404].includes(response.status)) continue;
+        continue;
+      }
+
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+
+      if (start < 0 || end < start)
+        return json({ found: false }, cors);
+
+      try {
+        const parsed = JSON.parse(text.slice(start, end + 1));
+        if (typeof parsed.found !== "boolean")
+          return json({ found: false }, cors);
+        return json(parsed, cors);
+      } catch {
+        return json({ found: false }, cors);
+      }
+    } catch (error) {
+      errors.push(String(error).slice(0, 120));
     }
   }
-  addAll(ddg, "ddg");
-  addAll(bing, "bing");
-  addAll(wiki, "wiki");
-  addAll(tav, "tavily");
-  return { query, count: all.length, results: all.slice(0, maxResults) };
+
+  return json({
+    error: "Vision providers failed",
+    details: errors.slice(0, 3)
+  }, cors, 502);
 }
 
-async function ddgSearch(query, numResults = 5) {
-  const ua = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile";
+// ============================================
+// DEPLOYMENT
+// ============================================
+
+async function handleDeploy(request, env, cors) {
+  // Configure DEPLOY_SECRET as a Worker secret before enabling deployment.
+  if (!env.DEPLOY_SECRET)
+    return json({ error: "Deployment disabled: DEPLOY_SECRET is not configured" }, cors, 503);
+
+  const authorization = request.headers.get("Authorization") || "";
+  const supplied = authorization.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : "";
+
+  if (!constantTimeEqual(supplied, env.DEPLOY_SECRET))
+    return json({ error: "Unauthorized" }, cors, 401);
+
+  if (!env.GITHUB_TOKEN)
+    return json({ error: "GitHub token not configured" }, cors, 503);
+
+  const body = await request.json();
+  const filePath = safeRepoPath(body.file_path);
+  const content = String(body.new_content || "");
+  const commitMessage = String(body.commit_message || "Sky AI: approved update").trim();
+
+  if (!filePath || !content)
+    return json({ error: "Missing or invalid file_path/new_content" }, cors, 400);
+
+  if (content.length > 100000)
+    return json({ error: "File content exceeds the 100 KB limit" }, cors, 413);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const rateKey = "deploys:" + today;
+  let count = 0;
+
+  if (env.SKY_MEMORY) {
+    try {
+      count = Number(await env.SKY_MEMORY.get(rateKey) || 0);
+    } catch {}
+  }
+
+  if (count >= 10)
+    return json({ error: "Daily deployment limit reached" }, cors, 429);
+
   try {
-    const formData = new URLSearchParams();
-    formData.append("q", query);
-    const response = await fetch("https://html.duckduckgo.com/html/", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": ua },
-      body: formData.toString()
+    const apiUrl = "https://api.github.com/repos/" + REPO +
+      "/contents/" + filePath.split("/").map(encodeURIComponent).join("/");
+
+    const headers = {
+      "Authorization": "Bearer " + env.GITHUB_TOKEN,
+      "Accept": "application/vnd.github+json",
+      "User-Agent": "SkyAI"
+    };
+
+    const getResponse = await fetchWithTimeout(apiUrl, { headers });
+    let sha = null;
+
+    if (getResponse.ok) {
+      sha = (await getResponse.json()).sha;
+    } else if (getResponse.status !== 404) {
+      return json({ error: "GitHub read HTTP " + getResponse.status }, cors, 502);
+    }
+
+    const encoded = btoa(unescape(encodeURIComponent(content)));
+    const putBody = {
+      message: commitMessage.slice(0, 150),
+      content: encoded,
+      branch: "main"
+    };
+    if (sha) putBody.sha = sha;
+
+    const putResponse = await fetchWithTimeout(apiUrl, {
+      method: "PUT",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(putBody)
     });
-    if (response.ok) {
-      const html = await response.text();
-      const results = parseDDG(html, numResults);
-      if (results.length > 0) return { results };
+
+    if (!putResponse.ok)
+      return json({
+        error: "GitHub write HTTP " + putResponse.status,
+        details: (await putResponse.text()).slice(0, 200)
+      }, cors, 502);
+
+    const result = await putResponse.json();
+
+    if (env.SKY_MEMORY) {
+      try {
+        await env.SKY_MEMORY.put(rateKey, String(count + 1), {
+          expirationTtl: 86400
+        });
+      } catch {}
     }
-  } catch (e) {}
-  return { results: [] };
+
+    return json({
+      ok: true,
+      file_path: filePath,
+      commit: result.commit?.sha,
+      message: "GitHub commit created"
+    }, cors);
+  } catch (error) {
+    return json({ error: String(error).slice(0, 250) }, cors, 500);
+  }
 }
 
-function parseDDG(html, numResults) {
-  const results = [];
-  try {
-    const blocks = html.split(/<div class="result[^"]*"[^>]*>/);
-    for (let i = 1; i < blocks.length && results.length < numResults; i++) {
-      const block = blocks[i];
-      const linkMatch = block.match(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/s);
-      const snippetMatch = block.match(/<a[^>]*class="result__snippet"[^>]*>(.*?)<\/a>/s);
-      if (linkMatch) {
-        let url = linkMatch[1];
-        const redirectMatch = url.match(/uddg=([^&]+)/);
-        if (redirectMatch) { try { url = decodeURIComponent(redirectMatch[1]); } catch (e) {} }
-        const title = stripTags(linkMatch[2]).trim();
-        const snippet = snippetMatch ? stripTags(snippetMatch[1]).trim() : "";
-        if (url.startsWith("http") && title) results.push({ title, url, snippet });
-      }
-    }
-  } catch (e) {}
-  return results;
+function constantTimeEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++)
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
-async function bingSearch(query, numResults = 5) {
+// ============================================
+// WEB SEARCH
+// ============================================
+
+async function multiSearch(env, query, maxResults = 5) {
+  const results = await Promise.all([
+    ddgSearch(query, maxResults).catch(() => ({ results: [] })),
+    bingSearch(query, maxResults).catch(() => ({ results: [] })),
+    wikiSearch(query).catch(() => ({ results: [] })),
+    tavily(env, query).catch(() => ({ results: [] }))
+  ]);
+
+  const combined = [];
+  const seen = new Set();
+
+  for (let i = 0; i < results.length; i++) {
+    const source = ["duckduckgo", "bing", "wikipedia", "tavily"][i];
+    for (const item of results[i].results || []) {
+      if (!item.url || seen.has(item.url)) continue;
+      seen.add(item.url);
+      combined.push({
+        title: item.title || "",
+        url: item.url,
+        snippet: String(item.snippet || "").slice(0, 400),
+        source
+      });
+      if (combined.length >= maxResults) break;
+    }
+    if (combined.length >= maxResults) break;
+  }
+
+  return { query, count: combined.length, results: combined };
+}
+
+async function ddgSearch(query, limit = 5) {
   try {
-    const response = await fetch(
-      "https://www.bing.com/search?q=" + encodeURIComponent(query) + "&count=" + numResults,
-      { headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile" } }
+    const response = await fetchWithTimeout("https://html.duckduckgo.com/html/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0"
+      },
+      body: new URLSearchParams({ q: query }).toString()
+    }, 12000);
+
+    if (!response.ok) return { results: [] };
+    return { results: parseDDG(await response.text(), limit) };
+  } catch {
+    return { results: [] };
+  }
+}
+
+function parseDDG(html, limit) {
+  const output = [];
+  const blocks = html.split(/<div class="result[^"]*"[^>]*>/);
+
+  for (let i = 1; i < blocks.length && output.length < limit; i++) {
+    const block = blocks[i];
+    const link = block.match(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/is);
+    const snippet = block.match(/class="result__snippet"[^>]*>(.*?)<\/a>/is);
+    if (!link) continue;
+
+    let url = link[1];
+    const redirect = url.match(/[?&]uddg=([^&]+)/);
+    if (redirect) {
+      try { url = decodeURIComponent(redirect[1]); } catch {}
+    }
+
+    const title = stripTags(link[2]);
+    if (url.startsWith("http") && title)
+      output.push({ title, url, snippet: snippet ? stripTags(snippet[1]) : "" });
+  }
+  return output;
+}
+
+async function bingSearch(query, limit = 5) {
+  try {
+    const response = await fetchWithTimeout(
+      "https://www.bing.com/search?q=" + encodeURIComponent(query) + "&count=" + limit,
+      { headers: { "User-Agent": "Mozilla/5.0" } },
+      12000
     );
+
     if (!response.ok) return { results: [] };
     const html = await response.text();
     const results = [];
     const blocks = html.split(/<li class="b_algo"/);
-    for (let i = 1; i < blocks.length && results.length < numResults; i++) {
-      const block = blocks[i];
-      const linkMatch = block.match(/<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/s);
-      const snippetMatch = block.match(/<p[^>]*>(.*?)<\/p>/s);
-      if (linkMatch) {
-        const url = linkMatch[1];
-        const title = stripTags(linkMatch[2]).trim();
-        const snippet = snippetMatch ? stripTags(snippetMatch[1]).trim() : "";
-        if (url.startsWith("http") && title) results.push({ title, url, snippet });
-      }
+
+    for (let i = 1; i < blocks.length && results.length < limit; i++) {
+      const link = blocks[i].match(/<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/is);
+      const snippet = blocks[i].match(/<p[^>]*>(.*?)<\/p>/is);
+      if (!link) continue;
+
+      const title = stripTags(link[2]);
+      if (link[1].startsWith("http") && title)
+        results.push({
+          title,
+          url: link[1],
+          snippet: snippet ? stripTags(snippet[1]) : ""
+        });
     }
     return { results };
-  } catch (e) {
+  } catch {
     return { results: [] };
   }
 }
@@ -898,92 +1009,129 @@ async function wikiSearch(query) {
   try {
     const url = "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" +
       encodeURIComponent(query) + "&format=json&srlimit=3&srprop=snippet";
-    const response = await fetch(url, { headers: { "User-Agent": "SkyAI/0.14" } });
+    const response = await fetchWithTimeout(url, {
+      headers: { "User-Agent": "SkyAI/0.14" }
+    }, 12000);
+
     if (!response.ok) return { results: [] };
     const data = await response.json();
-    const results = [];
-    for (const item of (data.query?.search || [])) {
-      results.push({
+
+    return {
+      results: (data.query?.search || []).map(item => ({
         title: item.title,
-        url: "https://en.wikipedia.org/wiki/" + encodeURIComponent(item.title.replace(/ /g, "_")),
-        snippet: stripTags(item.snippet || "").trim()
-      });
-    }
-    return { results };
-  } catch (e) {
+        url: "https://en.wikipedia.org/wiki/" +
+          encodeURIComponent(item.title.replace(/ /g, "_")),
+        snippet: stripTags(item.snippet || "")
+      }))
+    };
+  } catch {
     return { results: [] };
   }
 }
 
-function stripTags(s) {
-  return String(s).replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
-    .replace(/&quot;/g, "\"").replace(/&#x27;/g, "'")
-    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/\s+/g, " ").trim();
+function stripTags(value) {
+  return String(value)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-async function fetchPageText(url) {
+async function fetchPageText(rawUrl) {
   try {
-    const response = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120" },
+    const parsed = new URL(rawUrl);
+    if (!["http:", "https:"].includes(parsed.protocol))
+      return { error: "Only HTTP and HTTPS URLs are supported" };
+
+    const response = await fetchWithTimeout(parsed.toString(), {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; SkyAI/0.14)" },
       redirect: "follow"
-    });
+    }, 12000);
+
     if (!response.ok) return { error: "HTTP " + response.status };
-    const html = await response.text();
+
+    const html = (await response.text()).slice(0, 500000);
     const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/is);
     const title = titleMatch ? stripTags(titleMatch[1]) : "";
-    let body = html
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ");
-    let text = stripTags(body);
-    return { url, title, text: text.slice(0, 6000) };
-  } catch (e) {
-    return { error: String(e) };
+
+    const text = stripTags(
+      html.replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    );
+
+    return { url: parsed.toString(), title, text: text.slice(0, 6000) };
+  } catch (error) {
+    return { error: String(error).slice(0, 200) };
   }
 }
 
 async function deepResearch(env, query, maxPages = 3) {
   const search = await multiSearch(env, query, 6);
-  if (!search.results || search.results.length === 0) return { error: "No results", pages: [] };
+  if (!search.results.length)
+    return { error: "No search results", pages: [] };
+
   const pages = [];
-  for (let i = 0; i < Math.min(search.results.length, maxPages); i++) {
-    const r = search.results[i];
-    const page = await fetchPageText(r.url);
-    if (!page.error && page.text) {
-      pages.push({ url: r.url, title: page.title || r.title, text: page.text.slice(0, 1500) });
-    }
+  for (const item of search.results.slice(0, maxPages)) {
+    const page = await fetchPageText(item.url);
+    if (!page.error && page.text)
+      pages.push({
+        url: item.url,
+        title: page.title || item.title,
+        text: page.text.slice(0, 1500)
+      });
   }
-  return { query, search_results: search.results, pages, pages_read: pages.length };
+
+  return {
+    query,
+    search_results: search.results,
+    pages,
+    pages_read: pages.length
+  };
 }
 
 async function tavily(env, query) {
   const keys = getKeys(env.TAVILY_API_KEYS, env.TAVILY_API_KEY);
   if (!keys.length) return { results: [] };
-  const key = await pickKey(env, "tavily", keys);
-  if (!key) return { results: [] };
-  try {
-    const res = await fetch("https://api.tavily.com/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ api_key: key, query, search_depth: "basic", include_answer: true, max_results: 5 })
-    });
-    if (!res.ok) {
-      await markCooldown(env, "tavily", key);
-      return { results: [] };
-    }
-    const d = await res.json();
-    return {
-      answer: d.answer || "",
-      results: (d.results || []).slice(0, 5).map(r => ({
-        title: r.title, url: r.url, snippet: (r.content || "").slice(0, 400)
-      }))
-    };
-  } catch (e) {
-    return { results: [] };
-  }
-}
 
-// ============================================
-// END OF FILE
-// ============================================
+  for (const key of keys) {
+    const available = await pickKey(env, "tavily", [key]);
+    if (!available) continue;
+
+    try {
+      const response = await fetchWithTimeout("https://api.tavily.com/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_key: key,
+          query,
+          search_depth: "basic",
+          include_answer: true,
+          max_results: 5
+        })
+      }, 12000);
+
+      if (!response.ok) {
+        if (response.status === 429) await markCooldown(env, "tavily", key, 60);
+        continue;
+      }
+
+      const data = await response.json();
+      return {
+        answer: data.answer || "",
+        results: (data.results || []).slice(0, 5).map(item => ({
+          title: item.title || "",
+          url: item.url || "",
+          snippet: String(item.content || "").slice(0, 400)
+        }))
+      };
+    } catch {}
+  }
+
+  return { results: [] };
+}
