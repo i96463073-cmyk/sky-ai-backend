@@ -1,9 +1,9 @@
 // ============================================
-// SKY AI — v0.14.0
-// Accessibility-first actions (no vision needed for most)
+// SKY AI — v0.14.1
+// Accessibility-first + working model names
 // ============================================
 
-const GEMINI_MODEL = "gemini-2.0-flash-exp";
+const GEMINI_MODEL = "gemini-2.5-flash";
 const CF_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const MAX_ITER_SMALL = 10;
 const MAX_ITER_BIG = 25;
@@ -25,23 +25,24 @@ export default {
       return new Response(null, { status: 204, headers: cors });
 
     if (url.pathname === "/")
-      return json({ service: "Sky AI", version: "0.14.0", status: "online" }, cors);
+      return json({ service: "Sky AI", version: "0.14.1", status: "online" }, cors);
 
     if (url.pathname === "/brains")
       return json({
-        version: "0.14.0",
+        version: "0.14.1",
         brains: {
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
           cloudflare_ai: !!env.AI
         },
-        tools: { memory: !!env.SKY_MEMORY, github: !!env.GITHUB_TOKEN },
+        gemini_model: GEMINI_MODEL,
+        groq_models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
         strategy: "accessibility-first"
       }, cors);
 
     if (url.pathname === "/health")
       return json({
-        ok: true, service: "Sky AI", version: "0.14.0",
+        ok: true, service: "Sky AI", version: "0.14.1",
         gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
         groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
         cf_ai: !!env.AI,
@@ -103,7 +104,6 @@ export default {
 
         if (!gemRes.ok) {
           await markCooldown(env, "gemini", key);
-          const t = await gemRes.text();
           return json({ error: "Gemini " + gemRes.status }, cors, 502);
         }
         const gemData = await gemRes.json();
@@ -243,14 +243,12 @@ async function geminiChat(key, req) {
 }
 
 // ============================================
-// GROQ — current working models only
+// GROQ — only the two models confirmed working
 // ============================================
 async function groqRotate(key, req) {
   const models = [
     "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
-    "moonshotai/kimi-k2-instruct",
-    "qwen/qwen3-32b"
+    "openai/gpt-oss-120b"
   ];
   let lastErr = "no groq models";
   for (const m of models) {
@@ -264,11 +262,11 @@ async function groqRotate(key, req) {
     });
     if (r.ok) return r;
     lastErr = m + ": " + String(r.error || "").slice(0, 120);
-    if (r.error && !r.error.toLowerCase().includes("rate") && !r.error.toLowerCase().includes("decommission")) {
+    if (r.error && !r.error.toLowerCase().includes("rate")) {
       return { ok: false, error: lastErr };
     }
   }
-  return { ok: false, error: "All Groq models failed. " + lastErr };
+  return { ok: false, error: "Groq rate-limited. " + lastErr };
 }
 
 async function groqCall(key, body) {
@@ -407,7 +405,7 @@ async function callAI(env, req) {
 }
 
 // ============================================
-// SYSTEM PROMPT — ACCESSIBILITY-FIRST
+// SYSTEM PROMPT
 // ============================================
 function buildPrompt(facts, history) {
   const now = new Date();
@@ -430,26 +428,21 @@ User memory: ${mem}
 Recent:
 ${hist}
 
-═══ ⚡ ACT FIRST — NEVER ASK FOR CLARIFICATION ═══
+═══ ACT FIRST — NEVER ASK FOR CLARIFICATION ═══
 
 If user says "like the first 3 photos on Facebook":
 → Do it. Open Facebook. Tap Like buttons via TAP action.
 
-If user says "like post on Facebook":
-→ Assume they mean the first post in their feed. Tap its Like.
+Only ask if IMPOSSIBLE to guess OR destructive.
 
-Only ask if it's IMPOSSIBLE to guess OR destructive (payments, deletions, calls).
+═══ USE TAP (not VISION_TAP) FOR KNOWN APPS ═══
 
-═══ ⚡ USE TAP (NOT VISION_TAP) FOR KNOWN APPS ═══
+TAP finds buttons by accessibility text — fast, reliable, no screenshots.
+VISION_TAP is only fallback when TAP fails.
 
-TAP finds buttons by text in the accessibility tree — FAST, reliable, no screenshots needed.
-VISION_TAP uses screenshots — only fallback when TAP fails.
-
-Facebook's Like button has accessibility text "Like". Use TAP target:"Like".
-Instagram's heart icon has text "Like". Use TAP target:"Like".
-WhatsApp Send has text "Send". Use TAP target:"Send".
-Facebook comment box has text "comment". Use TAP target:"comment".
-Facebook post button has text "Post". Use TAP target:"Post".
+Facebook: Like="Like", comment="Comment", post="Post", composer="What's on your mind"
+Instagram: like="Like", comment="Comment"
+WhatsApp: send="Send"
 
 ═══ FACEBOOK RECIPES ═══
 
