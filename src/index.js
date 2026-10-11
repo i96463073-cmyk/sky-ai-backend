@@ -1,15 +1,60 @@
 // ============================================
-// SKY AI — v0.14.1
-// Accessibility-first + working model names
+// SKY AI — v0.14.2
+// Correct models + retry logic + full action support
 // ============================================
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.0-flash";
 const CF_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const MAX_ITER_SMALL = 10;
 const MAX_ITER_BIG = 25;
 const HISTORY_LIMIT = 6;
 const MEMORY_LIMIT = 20;
 const REPO = "i96463073-cmyk/Sky";
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ============================================
+// RESILIENT CALL WRAPPER
+// ============================================
+async function withRetry(name, env, fn) {
+  if (env.SKY_MEMORY) {
+    const cd = await env.SKY_MEMORY.get("cooldown:v2:" + name);
+    if (cd) return { ok: false, error: name + " cooling down" };
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await fn();
+      if (result && result.ok) return result;
+
+      const err = String(result?.error || "");
+
+      if (/40[134]/.test(err) || /not found|decommission|invalid|does not exist/i.test(err)) {
+        return result;
+      }
+
+      if (/429|rate limit/i.test(err)) {
+        if (env.SKY_MEMORY) {
+          await env.SKY_MEMORY.put("cooldown:v2:" + name, "1", { expirationTtl: 60 });
+        }
+        return result;
+      }
+
+      if (attempt === 0) {
+        await sleep(500);
+        continue;
+      }
+      return result;
+    } catch (e) {
+      if (attempt === 0) {
+        await sleep(500);
+        continue;
+      }
+      return { ok: false, error: String(e).slice(0, 200) };
+    }
+  }
+  return { ok: false, error: name + " failed after retries" };
+}
 
 export default {
   async fetch(request, env) {
@@ -25,11 +70,11 @@ export default {
       return new Response(null, { status: 204, headers: cors });
 
     if (url.pathname === "/")
-      return json({ service: "Sky AI", version: "0.14.1", status: "online" }, cors);
+      return json({ service: "Sky AI", version: "0.14.2", status: "online" }, cors);
 
     if (url.pathname === "/brains")
       return json({
-        version: "0.14.1",
+        version: "0.14.2",
         brains: {
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
@@ -37,12 +82,13 @@ export default {
         },
         gemini_model: GEMINI_MODEL,
         groq_models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
-        strategy: "accessibility-first"
+        cf_model: CF_MODEL,
+        strategy: "retry + cooldown + racing"
       }, cors);
 
     if (url.pathname === "/health")
       return json({
-        ok: true, service: "Sky AI", version: "0.14.1",
+        ok: true, service: "Sky AI", version: "0.14.2",
         gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
         groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
         cf_ai: !!env.AI,
@@ -207,7 +253,7 @@ async function markCooldown(env, provider, key) {
 }
 
 // ============================================
-// GEMINI
+// GEMINI CALL
 // ============================================
 async function geminiChat(key, req) {
   try {
@@ -243,7 +289,7 @@ async function geminiChat(key, req) {
 }
 
 // ============================================
-// GROQ — only the two models confirmed working
+// GROQ CALL (only 2 working models)
 // ============================================
 async function groqRotate(key, req) {
   const models = [
@@ -289,6 +335,9 @@ async function groqCall(key, body) {
   }
 }
 
+// ============================================
+// CLOUDFLARE AI
+// ============================================
 async function cfAICall(ai, req) {
   try {
     const cfBody = {
@@ -334,33 +383,45 @@ function isBigTask(req) {
   return false;
 }
 
+// ============================================
+// RACING BRAINS (parallel)
+// ============================================
 async function raceBrains(env, req) {
   const attempts = [];
 
   const gk = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
   if (gk.length) {
     const k = await pickKey(env, "gemini", gk);
-    if (k) attempts.push(geminiChat(k, req).then(r => {
-      if (!r.ok) { markCooldown(env, "gemini", k); return Promise.reject("g:" + String(r.error).slice(0, 80)); }
-      r.brain = "gemini"; return r;
-    }));
+    if (k) attempts.push(
+      withRetry("gemini", env, () => geminiChat(k, req)).then(r => {
+        if (!r.ok) return Promise.reject("g:" + String(r.error).slice(0, 80));
+        r.brain = "gemini";
+        return r;
+      })
+    );
   }
 
   const gqk = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
   if (gqk.length) {
     const k = await pickKey(env, "groq", gqk);
-    if (k) attempts.push(groqRotate(k, req).then(async r => {
-      if (!r.ok) { await markCooldown(env, "groq", k); return Promise.reject("q:" + String(r.error).slice(0, 80)); }
-      r.brain = "groq"; return r;
-    }));
+    if (k) attempts.push(
+      withRetry("groq", env, () => groqRotate(k, req)).then(r => {
+        if (!r.ok) return Promise.reject("q:" + String(r.error).slice(0, 80));
+        r.brain = "groq";
+        return r;
+      })
+    );
   }
 
-  if (env.AI) attempts.push(cfAICall(env.AI, req).then(r => {
-    if (!r.ok) return Promise.reject("c:" + String(r.error).slice(0, 80));
-    r.brain = "cloudflare"; return r;
-  }));
+  if (env.AI) attempts.push(
+    withRetry("cloudflare", env, () => cfAICall(env.AI, req)).then(r => {
+      if (!r.ok) return Promise.reject("c:" + String(r.error).slice(0, 80));
+      r.brain = "cloudflare";
+      return r;
+    })
+  );
 
-  if (attempts.length === 0) return { ok: false, error: "no brains" };
+  if (attempts.length === 0) return { ok: false, error: "no brains configured" };
   try {
     return await Promise.any(attempts);
   } catch (e) {
@@ -368,6 +429,9 @@ async function raceBrains(env, req) {
   }
 }
 
+// ============================================
+// SEQUENTIAL (small tasks)
+// ============================================
 async function callAI(env, req) {
   if (isBigTask(req)) return await raceBrains(env, req);
 
@@ -377,9 +441,8 @@ async function callAI(env, req) {
   if (gk.length) {
     const k = await pickKey(env, "gemini", gk);
     if (k) {
-      const r = await geminiChat(k, req);
+      const r = await withRetry("gemini", env, () => geminiChat(k, req));
       if (r.ok) { r.brain = "gemini"; return r; }
-      await markCooldown(env, "gemini", k);
       errors.push("gemini");
     }
   }
@@ -388,20 +451,19 @@ async function callAI(env, req) {
   if (gqk.length) {
     const k = await pickKey(env, "groq", gqk);
     if (k) {
-      const r = await groqRotate(k, req);
+      const r = await withRetry("groq", env, () => groqRotate(k, req));
       if (r.ok) { r.brain = "groq"; return r; }
-      await markCooldown(env, "groq", k);
       errors.push("groq");
     }
   }
 
   if (env.AI) {
-    const r = await cfAICall(env.AI, req);
+    const r = await withRetry("cloudflare", env, () => cfAICall(env.AI, req));
     if (r.ok) { r.brain = "cloudflare"; return r; }
-    errors.push("cf");
+    errors.push("cloudflare");
   }
 
-  return { ok: false, error: "BRAINS FAILED → " + (errors.join(" | ") || "none") };
+  return { ok: false, error: "BRAINS FAILED → " + (errors.join(" | ") || "none configured") };
 }
 
 // ============================================
