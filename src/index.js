@@ -1,11 +1,11 @@
 // ============================================
-// SKY AI — v0.13.1
-// Action recipes + act-first prompt
+// SKY AI — v0.13.2
+// Groq rotation + Gemini 2.5 + action recipes
 // ============================================
 
 const GROQ_MODEL = "openai/gpt-oss-20b";
 const GROQ_FALLBACK = "openai/gpt-oss-120b";
-const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_MODEL = "gemini-2.5-flash";
 const CF_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const MAX_ITER_SMALL = 10;
 const MAX_ITER_BIG = 25;
@@ -27,11 +27,11 @@ export default {
       return new Response(null, { status: 204, headers: cors });
 
     if (url.pathname === "/")
-      return json({ service: "Sky AI", version: "0.13.1", status: "online" }, cors);
+      return json({ service: "Sky AI", version: "0.13.2", status: "online" }, cors);
 
     if (url.pathname === "/brains")
       return json({
-        version: "0.13.1",
+        version: "0.13.2",
         brains: {
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
@@ -42,12 +42,12 @@ export default {
           memory: !!env.SKY_MEMORY,
           github: !!env.GITHUB_TOKEN
         },
-        strategy: "act-first + action recipes + parallel racing"
+        strategy: "act-first + action recipes + parallel racing + groq rotation"
       }, cors);
 
     if (url.pathname === "/health")
       return json({
-        ok: true, service: "Sky AI", version: "0.13.1",
+        ok: true, service: "Sky AI", version: "0.13.2",
         gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
         groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
         cf_ai: !!env.AI,
@@ -246,8 +246,34 @@ async function markCooldown(env, provider, key) {
 }
 
 // ============================================
-// BRAIN CALLS
+// GROQ — with model rotation
 // ============================================
+async function groqRotate(key, req) {
+  const models = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant"
+  ];
+  let lastErr = "no groq models tried";
+  for (const m of models) {
+    const r = await groqCall(key, {
+      model: m,
+      messages: req.messages,
+      tools: req.tools,
+      tool_choice: "auto",
+      temperature: req.temperature || 0.5,
+      max_tokens: req.max_tokens || 4000
+    });
+    if (r.ok) return r;
+    lastErr = m + ": " + String(r.error || "").slice(0, 120);
+    if (r.error && !r.error.toLowerCase().includes("rate")) {
+      return { ok: false, error: lastErr };
+    }
+  }
+  return { ok: false, error: "All Groq models rate-limited. " + lastErr };
+}
+
 async function groqCall(key, body) {
   try {
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -268,6 +294,9 @@ async function groqCall(key, body) {
   }
 }
 
+// ============================================
+// GEMINI
+// ============================================
 async function geminiChat(key, req) {
   try {
     const body = {
@@ -301,6 +330,9 @@ async function geminiChat(key, req) {
   }
 }
 
+// ============================================
+// CLOUDFLARE AI
+// ============================================
 async function cfAICall(ai, req) {
   try {
     const cfBody = {
@@ -347,7 +379,7 @@ function isBigTask(req) {
 }
 
 // ============================================
-// RACING
+// RACING (parallel brains)
 // ============================================
 async function raceBrains(env, req) {
   const attempts = [];
@@ -364,10 +396,7 @@ async function raceBrains(env, req) {
   const gqk = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
   if (gqk.length) {
     const k = await pickKey(env, "groq", gqk);
-    if (k) attempts.push(groqCall(k, {
-      model: GROQ_MODEL, messages: req.messages, tools: req.tools,
-      tool_choice: "auto", temperature: req.temperature, max_tokens: req.max_tokens
-    }).then(async r => {
+    if (k) attempts.push(groqRotate(k, req).then(async r => {
       if (!r.ok) { await markCooldown(env, "groq", k); return Promise.reject("q:" + String(r.error).slice(0, 80)); }
       r.brain = "groq"; return r;
     }));
@@ -386,6 +415,9 @@ async function raceBrains(env, req) {
   }
 }
 
+// ============================================
+// SEQUENTIAL
+// ============================================
 async function callAI(env, req) {
   if (isBigTask(req)) return await raceBrains(env, req);
 
@@ -406,10 +438,7 @@ async function callAI(env, req) {
   if (gqk.length) {
     const k = await pickKey(env, "groq", gqk);
     if (k) {
-      const r = await groqCall(k, {
-        model: GROQ_MODEL, messages: req.messages, tools: req.tools,
-        tool_choice: "auto", temperature: req.temperature, max_tokens: req.max_tokens
-      });
+      const r = await groqRotate(k, req);
       if (r.ok) { r.brain = "groq"; return r; }
       await markCooldown(env, "groq", k);
       errors.push("groq");
@@ -667,7 +696,7 @@ async function tavily(env, query) {
 }
 
 // ============================================
-// SYSTEM PROMPT — ACT FIRST, ASK NEVER
+// SYSTEM PROMPT — ACT FIRST
 // ============================================
 function buildPrompt(facts, history) {
   const now = new Date();
@@ -699,97 +728,77 @@ UNLESS the request is truly impossible to guess.
 
 If the user says "like the first 3 photos on Facebook":
 → Act. Open Facebook. Tap the first 3 Like buttons.
-→ Do NOT ask "which Facebook? which photos?"
 
 If the user says "call that number on WhatsApp":
-→ Open WhatsApp with that number. Type a message or start the call.
-→ Do NOT ask "what should I say?"
+→ Open WhatsApp with that number.
 
-If the user says "post good morning":
-→ Post "good morning".
-→ Do NOT ask "on which platform?"
-
-Only ask ONE question if the request is genuinely ambiguous AND action would be destructive (payments, calls to strangers, deletions).
+Only ask ONE question if genuinely ambiguous AND action would be destructive (payments, deletions, calls to strangers).
 
 ═══════════════════════════════════════════
-FACEBOOK ACTION RECIPES
+FACEBOOK RECIPES
 ═══════════════════════════════════════════
 
-When user asks to LIKE posts on Facebook, emit these actions IN ORDER:
+"Like 3 posts on Facebook":
+1. OPEN_APP "facebook"
+2. WAIT 3000
+3. VISION_TAP "Like button of the first post"
+4. SCROLL_DOWN
+5. WAIT 1500
+6. VISION_TAP "Like button of the next post"
+7. SCROLL_DOWN
+8. WAIT 1500
+9. VISION_TAP "Like button of the next post"
 
-1. phone_action OPEN_APP "facebook"
-2. phone_action WAIT 3000
-3. VISION_TAP target "Like button of the first post"
-4. phone_action SCROLL_DOWN
-5. phone_action WAIT 1500
-6. VISION_TAP target "Like button of the next post"
-7. phone_action SCROLL_DOWN
-8. phone_action WAIT 1500
-9. VISION_TAP target "Like button of the next post"
-10. reply: "Liked 3 posts."
+"Post on Facebook <text>":
+1. OPEN_APP "facebook"
+2. WAIT 3000
+3. VISION_TAP "What's on your mind box"
+4. WAIT 1500
+5. TYPE "<text>"
+6. WAIT 1000
+7. VISION_TAP "Post button"
 
-When user asks to POST on Facebook:
-1. phone_action OPEN_APP "facebook"
-2. phone_action WAIT 3000
-3. VISION_TAP target "What's on your mind box"
-4. phone_action WAIT 1500
-5. phone_action TYPE "<the text>"
-6. phone_action WAIT 1000
-7. VISION_TAP target "Post button"
-8. reply: "Posted."
-
-When user asks to COMMENT on a Facebook post:
-1. phone_action OPEN_APP "facebook"
-2. phone_action WAIT 3000
-3. VISION_TAP target "Comment button of the first post"
-4. phone_action WAIT 1500
-5. VISION_TAP target "Write a comment text box"
-6. phone_action TYPE "<comment text>"
-7. phone_action WAIT 1000
-8. VISION_TAP target "Post comment button"
-9. reply: "Commented."
+"Comment on Facebook <text>":
+1. OPEN_APP "facebook"
+2. WAIT 3000
+3. VISION_TAP "Comment button of first post"
+4. WAIT 1500
+5. VISION_TAP "Write a comment text box"
+6. TYPE "<text>"
+7. WAIT 1000
+8. VISION_TAP "Post comment button"
 
 ═══════════════════════════════════════════
-INSTAGRAM ACTION RECIPES
+INSTAGRAM RECIPE
 ═══════════════════════════════════════════
 
-Like 3 posts:
+"Like 3 photos on Instagram":
 1. OPEN_APP "instagram"
 2. WAIT 3000
-3. VISION_TAP target "Heart icon on first post"
+3. VISION_TAP "Heart icon on first post"
 4. SCROLL_DOWN, WAIT 1500
-5. VISION_TAP target "Heart icon"
+5. VISION_TAP "Heart icon"
 6. SCROLL_DOWN, WAIT 1500
-7. VISION_TAP target "Heart icon"
+7. VISION_TAP "Heart icon"
 
 ═══════════════════════════════════════════
-WHATSAPP ACTION RECIPES
+WHATSAPP RECIPE
 ═══════════════════════════════════════════
 
-"Call that number on WhatsApp":
-1. phone_action WHATSAPP_MESSAGE to:"<number>" message:""
-2. WAIT 2000
-3. reply "WhatsApp is open with that contact."
-
-"Send <name> a WhatsApp saying <text>":
-1. phone_action WHATSAPP_MESSAGE to:"<name or number>" message:"<text>"
+"Send <name> <text> on WhatsApp":
+1. WHATSAPP_MESSAGE to:"<name or number>" message:"<text>"
 2. WAIT 2500
-3. VISION_TAP target "Send button"
-4. reply "Message sent."
+3. VISION_TAP "Send button"
 
 ═══════════════════════════════════════════
 TOOLS
 ═══════════════════════════════════════════
 
-web_search(query) - Multi-source search
-read_url(url) - Read a page
-research(topic) - Deep research
-phone_action(action_type, ...) - Control the phone
-remember(fact) - Save permanent facts
-read_own_file(file_path) - Read Sky's code
-propose_code_change(file_path, summary, new_content) - Propose code changes
+web_search(query), read_url(url), research(topic),
+phone_action(action_type,...), remember(fact),
+read_own_file(path), propose_code_change(path, summary, content)
 
-PHONE ACTION TYPES:
+PHONE ACTIONS:
 OPEN_APP(query), SEARCH_WEB(query), WHATSAPP_MESSAGE(to,message),
 SEND_SMS(to,message), TAP(target), VISION_TAP(target), TYPE(text),
 READ_SCREEN, READ_SCREEN_VISION, GO_BACK, GO_HOME, SCROLL_DOWN,
@@ -803,15 +812,12 @@ REPO FILES:
 - app/src/main/res/layout/activity_main.xml
 
 ═══════════════════════════════════════════
-EFFICIENCY (FREE TIERS)
+EFFICIENCY
 ═══════════════════════════════════════════
 
-- Prefer direct answers over searches when you know the fact.
-- One search per question, not five.
-- 2 pages max per research.
+- One search per question. 2 pages max per research.
 - remember() to save facts.
-- Keep replies 1-3 sentences.
-- No markdown tables, no code fences.`;
+- Keep replies 1-3 sentences. No markdown tables or code fences.`;
 }
 
 // ============================================
@@ -847,7 +853,7 @@ async function runAgent(env, userId, userMessage) {
   const tools = [
     { type: "function", function: {
       name: "web_search",
-      description: "Multi-source search. Use once per question.",
+      description: "Multi-source search.",
       parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
     }},
     { type: "function", function: {
