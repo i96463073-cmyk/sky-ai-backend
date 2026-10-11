@@ -1,18 +1,16 @@
 // ============================================
-// SKY AI — v0.14.3
-// Sequential fallback + working models + no deploy break
+// SKY AI — v0.14.4
+// Force tool calls (not descriptions) + working models
 // ============================================
 
-const VERSION = "0.14.3";
+const VERSION = "0.14.4";
 
-// Try each Gemini model in order until one works
 const GEMINI_MODELS = [
   "gemini-2.5-flash",
   "gemini-2.0-flash",
   "gemini-1.5-flash"
 ];
 
-// Real Cloudflare AI models (try in order)
 const CF_MODELS = [
   "@cf/meta/llama-3.1-8b-instruct",
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -27,9 +25,9 @@ const GROQ_MODELS = [
 const REPO = "i96463073-cmyk/Sky";
 const HISTORY_LIMIT = 6;
 const MEMORY_LIMIT = 20;
-const MAX_TOOL_CALLS_PER_TURN = 12;
-const MAX_ITER_SMALL = 8;
-const MAX_ITER_BIG = 16;
+const MAX_TOOL_CALLS_PER_TURN = 15;
+const MAX_ITER_SMALL = 10;
+const MAX_ITER_BIG = 20;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -72,7 +70,7 @@ export default {
           gemini_keys: getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY).length,
           groq_keys: getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY).length,
           cloudflare_ai: !!env.AI,
-          strategy: "sequential fallback with per-key cooldown"
+          strategy: "sequential fallback + tool-call enforcement"
         }, cors);
 
       if (url.pathname === "/chat" && request.method === "POST") {
@@ -200,7 +198,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
 }
 
 // ============================================
-// GEMINI — tries each model until one works
+// GEMINI
 // ============================================
 async function geminiChat(key, req) {
   const errors = [];
@@ -235,13 +233,10 @@ async function geminiChat(key, req) {
         const errText = (await response.text()).slice(0, 220);
         errors.push(model + " HTTP " + response.status + ": " + errText);
 
-        // 404 = wrong model, try next
         if (response.status === 404) continue;
-        // 429 = rate limit, don't waste other models
         if (response.status === 429) {
           return { ok: false, error: "Gemini rate limit: " + errText };
         }
-        // Other errors — try next model anyway
         continue;
       }
 
@@ -259,7 +254,7 @@ async function geminiChat(key, req) {
 }
 
 // ============================================
-// GROQ — tries each model in order
+// GROQ
 // ============================================
 async function groqRotate(key, req) {
   const errors = [];
@@ -279,7 +274,6 @@ async function groqRotate(key, req) {
 
     errors.push(model + ": " + String(result.error || "").slice(0, 120));
 
-    // Auth failure — no point trying another model
     const match = String(result.error || "").match(/\b(400|401|403|404|413|422)\b/);
     if (match && [401, 403].includes(Number(match[1]))) break;
   }
@@ -317,7 +311,7 @@ async function groqCall(key, body) {
 }
 
 // ============================================
-// CLOUDFLARE AI — tries each model in order
+// CLOUDFLARE AI
 // ============================================
 async function cfAICall(env, req) {
   if (!env.AI) return { ok: false, error: "Cloudflare AI binding missing" };
@@ -364,17 +358,14 @@ async function cfAICall(env, req) {
 }
 
 // ============================================
-// MASTER AI CALLER — sequential fallback
+// MASTER AI CALLER
 // ============================================
 async function callAI(env, req) {
   const errors = [];
 
-  // 1. Gemini
   const geminiKeys = getKeys(env.GEMINI_API_KEYS, env.GEMINI_API_KEY);
   for (const key of geminiKeys) {
-    const result = await withRetry(
-      "gemini", env, () => geminiChat(key, req), key
-    );
+    const result = await withRetry("gemini", env, () => geminiChat(key, req), key);
     if (result.ok) {
       result.brain = "gemini";
       return result;
@@ -382,12 +373,9 @@ async function callAI(env, req) {
     errors.push(String(result.error || "Gemini failed").slice(0, 150));
   }
 
-  // 2. Groq
   const groqKeys = getKeys(env.GROQ_API_KEYS, env.GROQ_API_KEY);
   for (const key of groqKeys) {
-    const result = await withRetry(
-      "groq", env, () => groqRotate(key, req), key
-    );
+    const result = await withRetry("groq", env, () => groqRotate(key, req), key);
     if (result.ok) {
       result.brain = "groq";
       return result;
@@ -395,7 +383,6 @@ async function callAI(env, req) {
     errors.push(String(result.error || "Groq failed").slice(0, 150));
   }
 
-  // 3. Cloudflare AI
   if (env.AI) {
     const result = await withRetry("cloudflare", env, () => cfAICall(env, req));
     if (result.ok) {
@@ -412,7 +399,7 @@ async function callAI(env, req) {
 }
 
 // ============================================
-// PROMPT
+// PROMPT — FORCES REAL TOOL CALLS
 // ============================================
 function buildPrompt(facts, history) {
   const now = new Date();
@@ -427,31 +414,113 @@ function buildPrompt(facts, history) {
     hour12: false
   }).format(now);
 
-  return `You are Sky, an Android AI assistant that can use tools.
+  return `You are Sky, an Android AI agent that CONTROLS the phone via tools.
 
 Kenya time: ${localTime}
 Memory: ${(facts || []).slice(-MEMORY_LIMIT).join("; ") || "none"}
-Recent conversation:
+Recent:
 ${(history || []).slice(-HISTORY_LIMIT).map(m =>
-  m.role + ": " + String(m.content || "").slice(0, 300)
+  m.role + ": " + String(m.content || "").slice(0, 200)
 ).join("\n") || "none"}
 
-Act first — do not ask for confirmation unless the target or intent is truly impossible to guess,
-or the action is destructive (payments, deletions, calls to strangers).
+═══════════════════════════════════════════
+🔴 CRITICAL RULE — TOOL CALLS, NOT TALK
+═══════════════════════════════════════════
 
-Use TAP (not VISION_TAP) for known apps like Facebook, Instagram, WhatsApp — those buttons
-are visible in the accessibility tree.
+The ONLY way to make the phone do something is to CALL the phone_action tool.
 
-Facebook recipes:
-- "Like 3 photos on Facebook": OPEN_APP facebook → WAIT 4000 → TAP Like → WAIT → SCROLL_DOWN → TAP Like → WAIT → SCROLL_DOWN → TAP Like
-- "Post <text> on Facebook": OPEN_APP facebook → WAIT 4000 → TAP "What's on your mind" → WAIT 2000 → TYPE <text> → TAP Post
-- "Comment <text> on Facebook": OPEN_APP facebook → WAIT 4000 → TAP Comment → TAP "Write a comment" → TYPE <text> → TAP Post
+❌ WRONG: "I've queued opening Facebook." (no tool call = nothing happens)
+❌ WRONG: "I'll open Facebook and check." (no tool call = nothing happens)
+❌ WRONG: "What would you like me to open?" (user already said Facebook)
+❌ WRONG: "I've opened Facebook and requested the screen contents." (no tool call)
 
-Instagram: same pattern using TAP Like.
+✅ RIGHT: Call phone_action {action_type:"OPEN_APP", query:"facebook", say:"Opening Facebook."}
+✅ RIGHT: Then call phone_action {action_type:"WAIT", ms:4000, say:"Waiting for load."}
+✅ RIGHT: Then call phone_action {action_type:"TAP", target:"Like", say:"Tapping Like."}
 
-WhatsApp: WHATSAPP_MESSAGE to+message → WAIT → TAP Send.
+Every sentence you say about an action MUST be paired with a real tool call
+in the SAME response. Talking without a tool call = lying to the user.
 
-Keep replies to 1-3 sentences. No markdown tables or code fences.`;
+═══════════════════════════════════════════
+FACEBOOK LIKE RECIPE — EXECUTE THESE 11 CALLS
+═══════════════════════════════════════════
+
+User says: "like the first 3 photos on Facebook"
+Make these tool calls IN ONE RESPONSE:
+
+1.  phone_action {action_type:"OPEN_APP", query:"facebook", say:"Opening Facebook."}
+2.  phone_action {action_type:"WAIT", ms:4000, say:"Waiting for feed."}
+3.  phone_action {action_type:"TAP", target:"Like", say:"Liking first post."}
+4.  phone_action {action_type:"WAIT", ms:1000, say:"Moving on."}
+5.  phone_action {action_type:"SCROLL_DOWN", say:"Scrolling."}
+6.  phone_action {action_type:"WAIT", ms:1500, say:"Next post."}
+7.  phone_action {action_type:"TAP", target:"Like", say:"Liking second post."}
+8.  phone_action {action_type:"WAIT", ms:1000, say:"Moving on."}
+9.  phone_action {action_type:"SCROLL_DOWN", say:"Scrolling."}
+10. phone_action {action_type:"WAIT", ms:1500, say:"Next post."}
+11. phone_action {action_type:"TAP", target:"Like", say:"Liking third post."}
+
+After the tool calls, produce ONE short text: "Liked 3 posts on Facebook."
+
+═══════════════════════════════════════════
+OTHER RECIPES
+═══════════════════════════════════════════
+
+"Post <text> on Facebook":
+1. OPEN_APP facebook
+2. WAIT 4000
+3. TAP "What's on your mind"
+4. WAIT 2000
+5. TYPE text:"<text>"
+6. WAIT 800
+7. TAP "Post"
+
+"Comment <text> on Facebook":
+1. OPEN_APP facebook
+2. WAIT 4000
+3. TAP "Comment"
+4. WAIT 1500
+5. TAP "Write a comment"
+6. TYPE text:"<text>"
+7. WAIT 800
+8. TAP "Post"
+
+"Send <text> to <number> on WhatsApp":
+1. WHATSAPP_MESSAGE to:"<number>" message:"<text>"
+2. WAIT 2500
+3. TAP "Send"
+
+"Like 3 photos on Instagram":
+1. OPEN_APP instagram
+2. WAIT 4000
+3. TAP "Like"
+4. SCROLL_DOWN
+5. WAIT 1500
+6. TAP "Like"
+7. SCROLL_DOWN
+8. WAIT 1500
+9. TAP "Like"
+
+═══════════════════════════════════════════
+NEVER ASK — JUST EXECUTE
+═══════════════════════════════════════════
+
+If user says "like the first 3 photos on Facebook" they already told you:
+- Which app: Facebook
+- What to do: Like the first 3 photos
+
+DO NOT ask "which Facebook?" or "which photos?" or "would you like me to?"
+Just make the tool calls.
+
+Only ask if truly unguessable OR destructive (payments, deletions, calls to strangers).
+
+═══════════════════════════════════════════
+REPLIES
+═══════════════════════════════════════════
+
+- Emit ALL tool calls FIRST in your response.
+- Only produce final text AFTER your tool calls are queued.
+- Final text: 1-3 sentences. No markdown tables. No code fences.`;
 }
 
 // ============================================
@@ -503,7 +572,7 @@ async function runAgent(env, userId, userMessage) {
     }},
     { type: "function", function: {
       name: "phone_action",
-      description: "Queue a supported action for the connected Android app to execute.",
+      description: "Perform an action on the connected Android phone. You MUST call this to make the phone do anything. Chain many calls in one response.",
       parameters: {
         type: "object",
         properties: {
@@ -513,13 +582,13 @@ async function runAgent(env, userId, userMessage) {
               "VISION_TAP","TYPE","READ_SCREEN","READ_SCREEN_VISION","GO_BACK",
               "GO_HOME","SCROLL_DOWN","SCROLL_UP","WAIT"]
           },
-          query: { type: "string" },
-          to: { type: "string" },
-          message: { type: "string" },
-          target: { type: "string" },
-          text: { type: "string" },
-          ms: { type: "number" },
-          say: { type: "string" }
+          query: { type: "string", description: "App name for OPEN_APP, or search terms" },
+          to: { type: "string", description: "Recipient for WhatsApp/SMS" },
+          message: { type: "string", description: "Message body for WhatsApp/SMS" },
+          target: { type: "string", description: "Text label to tap for TAP/VISION_TAP" },
+          text: { type: "string", description: "Text to type for TYPE" },
+          ms: { type: "number", description: "Wait duration in ms for WAIT" },
+          say: { type: "string", description: "Short sentence to speak to the user" }
         },
         required: ["action_type", "say"]
       }
@@ -560,7 +629,6 @@ async function runAgent(env, userId, userMessage) {
   let lastBrain = "unknown";
   let toolCount = 0;
 
-  // Use big-task limit for complex requests
   const isBigTask = /research|analyze|compare|deep|every|all|complete|facebook|instagram|like|post|comment/i.test(userMessage);
   const maxIterations = isBigTask ? MAX_ITER_BIG : MAX_ITER_SMALL;
 
@@ -820,8 +888,7 @@ async function handleVision(request, env, cors) {
         );
 
         if (!response.ok) {
-          const error = "HTTP " + response.status;
-          errors.push(model + ": " + error);
+          errors.push(model + ": HTTP " + response.status);
           if (response.status === 429) {
             await markCooldown(env, "gemini", key, 60);
             break;
@@ -865,7 +932,6 @@ async function handleDeploy(request, env, cors) {
   if (!env.GITHUB_TOKEN)
     return json({ error: "GitHub token not configured" }, cors, 503);
 
-  // Optional: require secret if DEPLOY_SECRET is set
   if (env.DEPLOY_SECRET) {
     const authorization = request.headers.get("Authorization") || "";
     const supplied = authorization.startsWith("Bearer ")
@@ -1202,4 +1268,4 @@ async function tavily(env, query) {
   }
 
   return { results: [] };
-       }
+                                }
