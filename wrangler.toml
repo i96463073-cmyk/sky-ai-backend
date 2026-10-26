@@ -6,10 +6,6 @@ compatibility_date = "2024-03-01"
 [triggers]
 crons = ["*/15 * * * *"]
 
-# Add your KV namespace here if you have one for memory
-# [[kv_namespaces]]
-# binding = "SKY_MEMORY"
-# id = "your-kv-id"
 [[kv_namespaces]]
 binding = "SKY_MEMORY"
-id = "YOUR_ID_HERE"
+id = "42d82dd0aa524510ab4ede15f5e24a96"
