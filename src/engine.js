@@ -3,16 +3,14 @@ import { analyze } from "./smc/analyze.js";
 import { runAgent } from "./agent.js";
 
 export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
-  console.log(`[ENGINE] Starting analysis for ${symbol} ${tfKey}`);
-
   try {
     // 1. Fetch Data
     const data = await getMarketData(env, symbol, tfKey, 300);
-    if (!data.ok) throw new Error("Data fetch failed: " + JSON.stringify(data.error));
+    if (!data.ok) return "ERROR: Data fetch failed - " + JSON.stringify(data.error);
 
     // 2. Run SMC Math
     const analysis = analyze(data.candles, tfKey);
-    if (!analysis.ok) throw new Error("Analysis failed: " + analysis.message);
+    if (!analysis.ok) return "ERROR: Analysis failed - " + analysis.message;
 
     const currentPrice = analysis.lastClosedCandle.close;
     
@@ -23,7 +21,7 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
     });
 
     if (!activeOB) {
-      return console.log(`[ENGINE] No active OB near ${currentPrice}. No signal generated.`);
+      return `No active Order Block near price (${currentPrice}). No signal generated.`;
     }
 
     // 4. Calculate Trade Parameters
@@ -35,10 +33,8 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
     const risk = Math.abs(entry - stopLoss);
     const takeProfit = isBuy ? entry + (risk * 2) : entry - (risk * 2); // 1:2 Risk/Reward
 
-    console.log(`[ENGINE] Found setup: ${isBuy ? 'BUY' : 'SELL'} ${symbol} @ ${entry}`);
-
     // 5. AI News Check
-    const prompt = `I am about to take a ${isBuy ? 'BUY' : 'SELL'} on ${symbol}. Entry: ${entry.toFixed(5)}, SL: ${stopLoss.toFixed(5)}. Search the news. Is there any high-impact news in the next 2 hours that would invalidate this trade?`;
+    const prompt = `I am about to take a ${isBuy ? 'BUY' : 'SELL'} on ${symbol}. Entry: ${entry.toFixed(5)}, SL: ${stopLoss.toFixed(5)}. Search the news. Is there any high-impact news in the next 2 hours that would invalidate this trade? Reply ONLY in JSON format: {"recommendation": "APPROVE" | "BLOCK", "reason": "..."}`;
     
     const aiResponse = await runAgent(env, "system", prompt);
     
@@ -47,11 +43,11 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
       const match = aiResponse.reply.match(/\{[\s\S]*\}/);
       if (match) aiDecision = JSON.parse(match[0]);
     } catch (e) {
-      console.log("[ENGINE] AI Parse Error:", aiResponse.reply);
+      return "ERROR: AI returned invalid JSON format.";
     }
 
     if (aiDecision.recommendation !== "APPROVE") {
-      return console.log(`[ENGINE] Trade BLOCKED by News AI: ${aiDecision.reason}`);
+      return `Trade BLOCKED by News AI: ${aiDecision.reason}`;
     }
 
     // 6. Send to Telegram
@@ -73,10 +69,14 @@ RR: 1:2
       body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message, parse_mode: "Markdown" })
     });
 
-    if (!tgRes.ok) throw new Error("Telegram send failed.");
-    console.log(`[ENGINE] Signal successfully sent to Telegram!`);
+    if (!tgRes.ok) {
+      const tgError = await tgRes.text();
+      return "ERROR: Telegram send failed. " + tgError;
+    }
+
+    return `SUCCESS! Signal sent to Telegram.\n\n${isBuy ? 'BUY' : 'SELL'} ${symbol} at ${entry.toFixed(5)}`;
 
   } catch (error) {
-    console.error("[ENGINE ERROR]", error.message);
+    return "CRITICAL ERROR: " + error.message;
   }
 }
