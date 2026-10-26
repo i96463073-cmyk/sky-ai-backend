@@ -1,5 +1,6 @@
 import { getMarketData } from "./market/biquote.js";
 import { analyze } from "./smc/analyze.js";
+import { runAgent } from "./agent.js";
 
 export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
   try {
@@ -13,47 +14,52 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
 
     const currentPrice = Number(analysis.lastClosedCandle.close);
     
-    // 3. Find Active Order Block (FORCE TEST)
-    let activeOB = analysis.orderBlocks.find(ob => {
-      // Using safe property check (handles high/low or top/bottom)
+    // 3. Find Active Order Block (Strict 0.5% distance rule restored)
+    const activeOB = analysis.orderBlocks.find(ob => {
       const obHigh = ob.high || ob.top || currentPrice;
       const distance = Math.abs(currentPrice - obHigh) / currentPrice;
-      return distance < 0.5; 
+      return distance < 0.005; 
     });
 
-    if (!activeOB && analysis.orderBlocks.length > 0) {
-      activeOB = analysis.orderBlocks[0];
-    } else if (!activeOB) {
-      activeOB = { high: currentPrice + 2, low: currentPrice - 2 };
+    if (!activeOB) {
+      return `No active Order Block near price (${currentPrice}). No signal generated.`;
     }
 
-    // 4. Calculate Trade Parameters (with SAFE fallbacks so it never crashes)
+    // 4. Calculate Trade Parameters
     const isBuy = analysis.trend === "BULLISH";
-    
-    // Safely grab the high and low, defaulting to current price if missing
     const obHigh = Number(activeOB.high || activeOB.top || currentPrice);
     const obLow = Number(activeOB.low || activeOB.bottom || currentPrice);
-    const atrBuffer = Number(analysis.atr?.value || 2) * 0.5; // default to 2 if ATR missing
+    const atrBuffer = Number(analysis.atr?.value || 2) * 0.5;
     
     const entry = isBuy ? obHigh : obLow;
     const stopLoss = isBuy ? (obLow - atrBuffer) : (obHigh + atrBuffer);
     const risk = Math.abs(entry - stopLoss);
     const takeProfit = isBuy ? (entry + (risk * 2)) : (entry - (risk * 2)); 
 
-    // Ensure all variables are valid numbers before formatting
     const safeEntry = Number(entry) || currentPrice;
     const safeSL = Number(stopLoss) || (currentPrice - 5);
     const safeTP = Number(takeProfit) || (currentPrice + 10);
 
-    // 5. AI News Check (FORCE TEST: Bypassed)
-    const aiDecision = { 
-      recommendation: "APPROVE", 
-      reason: "Test signal forced by developer to verify Telegram connection." 
-    };
+    // 5. Real AI News Check
+    const prompt = `I am about to take a ${isBuy ? 'BUY' : 'SELL'} on ${symbol}. Entry: ${safeEntry.toFixed(5)}, SL: ${safeSL.toFixed(5)}. Search the news. Is there any high-impact news in the next 2 hours that would invalidate this trade? Reply ONLY in JSON format: {"recommendation": "APPROVE" | "BLOCK", "reason": "..."}`;
+    
+    const aiResponse = await runAgent(env, "system", prompt);
+    
+    let aiDecision = { recommendation: "BLOCK", reason: "Failed to parse AI response" };
+    try {
+      const match = aiResponse.reply.match(/\{[\s\S]*\}/);
+      if (match) aiDecision = JSON.parse(match[0]);
+    } catch (e) {
+      return "Trade BLOCKED: AI returned invalid JSON format.";
+    }
+
+    if (aiDecision.recommendation !== "APPROVE") {
+      return `Trade BLOCKED by News AI: ${aiDecision.reason}`;
+    }
 
     // 6. Send to Telegram
     const message = `
-🚨 **SKY AI TEST SIGNAL** 🚨
+🚨 **SKY AI SIGNAL** 🚨
 Pair: **${symbol}** (${tfKey})
 Direction: **${isBuy ? 'BUY 🟢' : 'SELL 🔴'}**
 Entry: ${safeEntry.toFixed(5)}
@@ -72,10 +78,10 @@ RR: 1:2
 
     if (!tgRes.ok) {
       const tgError = await tgRes.text();
-      return "ERROR: Telegram send failed. Please check your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Cloudflare. Details: " + tgError;
+      return "ERROR: Telegram send failed. Details: " + tgError;
     }
 
-    return `SUCCESS! Signal sent to Telegram.\n\n${isBuy ? 'BUY' : 'SELL'} ${symbol} at ${safeEntry.toFixed(5)}`;
+    return `SUCCESS! Real signal sent to Telegram.\n\n${isBuy ? 'BUY' : 'SELL'} ${symbol} at ${safeEntry.toFixed(5)}`;
 
   } catch (error) {
     return "CRITICAL ERROR: " + error.message;
