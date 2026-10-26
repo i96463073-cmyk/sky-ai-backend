@@ -1,3 +1,12 @@
 name = "sky-ai-backend"
 main = "src/index.js"
-compatibility_date = "2026-10-07"
+compatibility_date = "2024-03-01"
+
+# Run every 15 minutes
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Add your KV namespace here if you have one for memory
+# [[kv_namespaces]]
+# binding = "SKY_MEMORY"
+# id = "your-kv-id"
