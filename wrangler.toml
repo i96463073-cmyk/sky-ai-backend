@@ -10,3 +10,6 @@ crons = ["*/15 * * * *"]
 # [[kv_namespaces]]
 # binding = "SKY_MEMORY"
 # id = "your-kv-id"
+[[kv_namespaces]]
+binding = "SKY_MEMORY"
+id = "YOUR_ID_HERE"
