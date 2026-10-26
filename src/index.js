@@ -6,7 +6,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. CORS Headers
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -17,12 +16,12 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // 2. Route: /api/* (Your existing Read-Only API)
+    // Route: /api/*
     if (url.pathname.startsWith("/api/")) {
       return handleApi(request, env);
     }
 
-    // 3. Route: /chat (Legacy Chat)
+    // Route: /chat
     if (url.pathname === "/chat" && request.method === "POST") {
       const body = await request.json();
       const result = await runAgent(env, "user", body.message);
@@ -31,29 +30,23 @@ export default {
       });
     }
 
-    // 4. Route: /test-signal (Manual trigger for testing)
+    // Route: /test-signal (Now prints result to screen)
     if (url.pathname === "/test-signal") {
-      // Run synchronously for testing so you can see the result
-      await runSignalEngine(env, "XAUUSD", "M15");
-      return new Response("Signal engine triggered. Check console/Telegram.", { 
-        headers: { ...corsHeaders, "Content-Type": "text/plain" } 
+      const resultText = await runSignalEngine(env, "XAUUSD", "M15");
+      return new Response(resultText, { 
+        headers: { ...corsHeaders, "Content-Type": "text/plain; charset=UTF-8" } 
       });
     }
 
-    // 5. Default: Health Check
+    // Health Check
     return new Response(JSON.stringify({ status: "online", version: "1.0.0" }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
   },
 
-  // ============================================
-  // CRON TRIGGER (Runs automatically based on wrangler.toml)
-  // ============================================
+  // CRON TRIGGER (Runs automatically)
   async scheduled(event, env, ctx) {
-    // This runs every 15 minutes (e.g., XAUUSD on the 15m timeframe)
+    // This will run in the background without displaying to a screen
     ctx.waitUntil(runSignalEngine(env, "XAUUSD", "M15"));
-    
-    // You can add more pairs here to check simultaneously:
-    // ctx.waitUntil(runSignalEngine(env, "EURUSD", "M15"));
   }
 };
