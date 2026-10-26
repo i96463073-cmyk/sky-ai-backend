@@ -1,6 +1,5 @@
 import { getMarketData } from "./market/biquote.js";
 import { analyze } from "./smc/analyze.js";
-import { runAgent } from "./agent.js";
 
 export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
   try {
@@ -19,8 +18,6 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
       for (let trade of pendingTrades) {
         let isWin = false;
         let isLoss = false;
-
-        // Check if price hit Take Profit or Stop Loss
         if (trade.direction === "BUY") {
           if (currentPrice >= trade.take_profit) isWin = true;
           else if (currentPrice <= trade.stop_loss) isLoss = true;
@@ -37,25 +34,23 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
           stillPending.push(trade);
         }
       }
-
-      // Save updated lists back to database
       await env.SKY_MEMORY.put("pending_trades", JSON.stringify(stillPending));
       await env.SKY_MEMORY.put("completed_trades", JSON.stringify(completedTrades));
     }
 
-    // 3. Run SMC Math to find NEW trades
+    // 3. Find NEW trades (FORCE TEST MODE)
     const analysis = analyze(data.candles, tfKey);
     if (!analysis.ok) return "ERROR: Analysis failed.";
 
-    const activeOB = analysis.orderBlocks.find(ob => {
+    // We use a very wide distance so it ALWAYS finds a setup for testing
+    let activeOB = analysis.orderBlocks.find(ob => {
       const obHigh = ob.high || ob.top || currentPrice;
       const distance = Math.abs(currentPrice - obHigh) / currentPrice;
-      return distance < 0.005; 
+      return distance < 0.5; 
     });
+    if (!activeOB && analysis.orderBlocks.length > 0) activeOB = analysis.orderBlocks[0];
+    if (!activeOB) activeOB = { high: currentPrice + 2, low: currentPrice - 2 };
 
-    if (!activeOB) return `No active setup near ${currentPrice}.`;
-
-    // 4. Calculate Trade Parameters
     const isBuy = analysis.trend === "BULLISH";
     const obHigh = Number(activeOB.high || activeOB.top || currentPrice);
     const obLow = Number(activeOB.low || activeOB.bottom || currentPrice);
@@ -66,21 +61,10 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
     const risk = Math.abs(entry - stopLoss);
     const takeProfit = isBuy ? (entry + (risk * 2)) : (entry - (risk * 2)); 
 
-    // 5. AI News Check
-    const prompt = `I am about to take a ${isBuy ? 'BUY' : 'SELL'} on ${symbol}. Entry: ${entry.toFixed(5)}. Search news. Reply ONLY JSON: {"recommendation": "APPROVE" | "BLOCK", "reason": "..."}`;
-    const aiResponse = await runAgent(env, "system", prompt);
-    
-    let aiDecision = { recommendation: "APPROVE", reason: "AI skipped or failed." };
-    try {
-      const match = aiResponse.reply.match(/\{[\s\S]*\}/);
-      if (match) aiDecision = JSON.parse(match[0]);
-    } catch (e) {}
+    // 4. AI CHECK BYPASSED FOR TESTING
+    const aiDecision = { recommendation: "APPROVE", reason: "Test Mode Active" };
 
-    if (aiDecision.recommendation !== "APPROVE") {
-      return `Trade BLOCKED by AI: ${aiDecision.reason}`;
-    }
-
-    // 6. Save NEW trade to Database
+    // 5. Save NEW trade to Database
     const newTrade = {
       id: Date.now().toString(),
       symbol: symbol,
@@ -98,15 +82,15 @@ export async function runSignalEngine(env, symbol = "XAUUSD", tfKey = "M15") {
       await env.SKY_MEMORY.put("pending_trades", JSON.stringify(pendingTrades));
     }
 
-    // 7. Send to Telegram
-    const message = `🚨 **NEW SIGNAL** 🚨\nPair: ${symbol}\nDirection: **${newTrade.direction}**\nEntry: ${newTrade.entry}\nSL: ${newTrade.stop_loss}\nTP: ${newTrade.take_profit}`;
+    // 6. Send to Telegram
+    const message = `🚨 **TEST SIGNAL** 🚨\nPair: ${symbol}\nDirection: **${newTrade.direction}**\nEntry: ${newTrade.entry}\nSL: ${newTrade.stop_loss}\nTP: ${newTrade.take_profit}`;
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message, parse_mode: "Markdown" })
     });
 
-    return "SUCCESS! Signal generated and saved.";
+    return `SUCCESS! Signal saved to DB. ${newTrade.direction} at ${newTrade.entry}`;
   } catch (error) {
     return "ERROR: " + error.message;
   }
