@@ -2,6 +2,8 @@
 
 import { SYMBOLS, TIMEFRAMES } from "./market/symbols.js";
 import { getMarketData, assessFreshness, providerState } from "./market/biquote.js";
+import { analyze } from "./smc/analyze.js";
+import { ENGINE_VERSION } from "./smc/config.js";
 
 export const API_VERSION = "signals-api-0.1.0";
 const MAX_LIMIT = 300;
@@ -28,6 +30,7 @@ export async function handleApi(request, env = {}, deps = {}) {
   const url = new URL(request.url);
   if (url.pathname === "/api/health") return health(env, now);
   if (url.pathname === "/api/market") return market(url, env, deps, now);
+  if (url.pathname === "/api/analysis") return analysis(url, env, deps, now);
   return fail(404, "NOT_FOUND", "Unknown API route");
 }
 
@@ -71,23 +74,7 @@ async function market(url, env, deps, now) {
   const bucket = limit <= 100 ? 100 : MAX_LIMIT;
   const data = await getMarketData(env, symbol, tfKey, bucket, deps);
 
-  if (!data.ok) {
-    const status = data.error.code === "RATE_LIMITED" ? 503 : 502;
-    const extra = data.error.retryAfter ? { "Retry-After": String(data.error.retryAfter) } : {};
-    return reply(
-      {
-        ok: false,
-        provider: "Biquote",
-        symbol,
-        timeframe: tfKey,
-        error: { code: data.error.code, message: data.error.message },
-        lastSuccessfulUpdate: iso(data.lastSuccessfulUpdate),
-        note: "No candles are shown because live data could not be loaded."
-      },
-      status,
-      extra
-    );
-  }
+  if (!data.ok) return providerFailure(data, symbol, tfKey);
 
   const shown = data.candles.slice(-limit);
   const last = data.candles[data.candles.length - 1];
@@ -114,5 +101,57 @@ async function market(url, env, deps, now) {
     quality: data.quality,
     volumeNote: "tickVolume is a provider-supplied tick count, not centralized exchange volume",
     candles: shown.map(c => ({ t: c.iso, o: c.open, h: c.high, l: c.low, c: c.close, tickVolume: c.tickVolume, closed: c.closed }))
+  });
+}
+
+function providerFailure(data, symbol, tfKey) {
+  const status = data.error.code === "RATE_LIMITED" ? 503 : 502;
+  const extra = data.error.retryAfter ? { "Retry-After": String(data.error.retryAfter) } : {};
+  return reply(
+    {
+      ok: false,
+      provider: "Biquote",
+      symbol,
+      timeframe: tfKey,
+      error: { code: data.error.code, message: data.error.message },
+      lastSuccessfulUpdate: iso(data.lastSuccessfulUpdate),
+      note: "No candles are shown because live data could not be loaded."
+    },
+    status,
+    extra
+  );
+}
+
+async function analysis(url, env, deps, now) {
+  const symbol = String(url.searchParams.get("symbol") || "XAUUSD").toUpperCase();
+  const tfKey = String(url.searchParams.get("tf") || "M15").toUpperCase();
+  if (!SYMBOLS[symbol]) return fail(400, "UNSUPPORTED_SYMBOL", "Unsupported symbol. Use one of: " + Object.keys(SYMBOLS).join(", "));
+  if (!TIMEFRAMES[tfKey]) return fail(400, "UNSUPPORTED_TIMEFRAME", "Unsupported timeframe. Use one of: " + Object.keys(TIMEFRAMES).join(", "));
+
+  const data = await getMarketData(env, symbol, tfKey, MAX_LIMIT, deps);
+  if (!data.ok) return providerFailure(data, symbol, tfKey);
+
+  const result = analyze(data.candles, tfKey);
+  if (!result.ok) return fail(422, result.code, result.message);
+
+  const freshness = assessFreshness(data.candles, tfKey, now());
+  const reasons = [];
+  if (freshness.status === "stale") reasons.push("Market data is stale");
+  if (freshness.status === "no_data") reasons.push("No market data");
+  const recentGaps = data.quality.gaps.filter(g => !g.expected && Date.parse(g.to) >= data.candles[Math.max(0, data.candles.length - 50)].time);
+
+  return reply({
+    ok: true,
+    provider: "Biquote",
+    symbol,
+    timeframe: tfKey,
+    engineVersion: ENGINE_VERSION,
+    fetchedAt: iso(data.fetchedAt),
+    freshness,
+    dataReliable: reasons.length === 0,
+    reliabilityReasons: reasons,
+    warnings: recentGaps.length ? ["Unexpected gaps in the last 50 candles: " + recentGaps.length] : [],
+    notice: "Detections are analytical information only. They are not trade signals or financial advice.",
+    analysis: result
   });
 }
