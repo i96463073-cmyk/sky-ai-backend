@@ -1,8 +1,3 @@
-// engine.js
-// SKY AI SIGNALS — market data, SMC analysis, signal decisions,
-// chart annotations, data-quality checks, duplicate protection,
-// and optional Telegram delivery.
-
 import { SYMBOLS, TIMEFRAMES } from "./market/symbols.js";
 import {
   getMarketData,
@@ -15,509 +10,359 @@ import {
 } from "./smc/decision.js";
 
 const ENGINE_VERSION = "2.0.0";
-const CANDLE_LIMIT = 300;
+const DEFAULT_CANDLE_LIMIT = 300;
+const MIN_CLOSED_CANDLES = 30;
 
-// Conservative defaults. Configure these as Worker variables
-// if you want to change the quality thresholds.
-const MIN_CANDLES = 80;
-const MAX_UNEXPECTED_GAPS = 2;
-const DEDUPE_TTL_SECONDS = 60 * 60 * 24;
-
-function json(data) {
-  return JSON.stringify(data);
-}
-
-function response(status, message, extra = {}) {
-  return json({
-    ok: false,
-    engineVersion: ENGINE_VERSION,
-    status,
-    message,
-    ...extra
-  });
-}
-
-function finiteNumber(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function normalizeCandles(candles) {
-  if (!Array.isArray(candles)) return [];
-
-  return candles
-    .filter(c =>
-      c &&
-      finiteNumber(c.time) &&
-      finiteNumber(c.open) &&
-      finiteNumber(c.high) &&
-      finiteNumber(c.low) &&
-      finiteNumber(c.close)
-    )
-    .slice()
-    .sort((a, b) => a.time - b.time);
-}
-
-function getClosedCandles(candles) {
-  return candles.filter(c => c.closed === true);
-}
-
-function candleSummary(candles) {
-  if (!candles.length) return null;
-
-  const c = candles[candles.length - 1];
-
-  return {
-    time: c.iso || new Date(c.time).toISOString(),
-    timestamp: c.time,
-    open: c.open,
-    high: c.high,
-    low: c.low,
-    close: c.close,
-    closed: c.closed === true
-  };
-}
-
-function getUnexpectedGapCount(quality) {
-  const gaps = quality?.unexpectedGaps;
-
-  if (Array.isArray(gaps)) return gaps.length;
-  if (typeof gaps === "number") return gaps;
-
-  return 0;
-}
-
-function getDataQualityWarnings(quality) {
-  const warnings = Array.isArray(quality?.warnings)
-    ? quality.warnings
-    : [];
-
-  return warnings;
-}
-
-function buildSignalId(symbol, timeframe, setup, lastCandle) {
-  const zoneKey =
-    setup?.candidateZone?.orderBlockTime ??
-    setup?.candidateZone?.top ??
-    "no-zone";
-
-  const entry = setup?.levels?.planned_entry ?? "no-entry";
-
-  return [
-    symbol,
-    timeframe,
-    setup?.direction ?? "NONE",
-    zoneKey,
-    entry,
-    lastCandle?.time ?? "no-candle"
-  ].join(":");
-}
-
-async function readKV(env, key) {
-  if (!env.SKY_MEMORY) return null;
+function jsonSafe(value) {
+  if (value === undefined) return null;
 
   try {
-    return await env.SKY_MEMORY.get(key);
+    return JSON.parse(JSON.stringify(value, (_key, item) => {
+      if (typeof item === "number" && !Number.isFinite(item)) {
+        return null;
+      }
+
+      return item;
+    }));
   } catch {
     return null;
   }
 }
 
-async function writeKV(env, key, value, options = {}) {
-  if (!env.SKY_MEMORY) return false;
+function getClosedCandles(candles) {
+  if (!Array.isArray(candles)) return [];
 
-  try {
-    await env.SKY_MEMORY.put(key, value, options);
-    return true;
-  } catch {
-    return false;
-  }
+  return candles
+    .filter(c => c && c.closed === true)
+    .filter(c =>
+      Number.isFinite(Number(c.time)) &&
+      Number.isFinite(Number(c.open)) &&
+      Number.isFinite(Number(c.high)) &&
+      Number.isFinite(Number(c.low)) &&
+      Number.isFinite(Number(c.close))
+    )
+    .filter(c => {
+      const open = Number(c.open);
+      const high = Number(c.high);
+      const low = Number(c.low);
+      const close = Number(c.close);
+
+      return (
+        high >= Math.max(open, close, low) &&
+        low <= Math.min(open, close, high) &&
+        low > 0
+      );
+    })
+    .sort((a, b) => Number(a.time) - Number(b.time));
 }
 
-async function sendTelegram(env, text) {
-  const token = env.TELEGRAM_BOT_TOKEN;
-  const chatId = env.TELEGRAM_CHAT_ID;
+function summarizeCandle(candle) {
+  if (!candle) return null;
 
-  // Telegram is optional. Signal generation still works without it.
-  if (!token || !chatId) {
-    return {
-      configured: false,
-      sent: false,
-      reason: "Telegram credentials are not configured."
-    };
-  }
-
-  try {
-    const result = await fetch(
-      `https://api.telegram.org/bot${token}/sendMessage`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text,
-          disable_web_page_preview: true
-        })
-      }
-    );
-
-    const data = await result.json();
-
-    if (!result.ok || data.ok !== true) {
-      return {
-        configured: true,
-        sent: false,
-        reason: data.description || `Telegram HTTP ${result.status}`
-      };
-    }
-
-    return {
-      configured: true,
-      sent: true
-    };
-  } catch (error) {
-    return {
-      configured: true,
-      sent: false,
-      reason: error?.message || "Telegram request failed."
-    };
-  }
+  return {
+    time: Math.floor(Number(candle.time) / 1000),
+    iso: candle.iso || new Date(Number(candle.time)).toISOString(),
+    open: Number(candle.open),
+    high: Number(candle.high),
+    low: Number(candle.low),
+    close: Number(candle.close),
+    volume: Number(candle.tickVolume ?? candle.volume ?? 0)
+  };
 }
 
-function formatPrice(value) {
-  if (!finiteNumber(value)) return "N/A";
-
-  return value.toLocaleString("en-US", {
-    maximumFractionDigits: 5
-  });
+function summarizeCandles(candles) {
+  return candles.map(summarizeCandle);
 }
 
-function formatTelegramSignal(symbol, timeframe, setup, market, analysis) {
-  const direction = setup.direction || "NO TRADE";
-  const levels = setup.levels || {};
+function getQuality(market, closedCandles) {
+  const source = market.quality || {};
 
-  const reasons = Array.isArray(setup.reasons)
-    ? setup.reasons.slice(0, 6)
-    : [];
+  return {
+    received: Number(source.received ?? market.candles?.length ?? 0),
+    accepted: Number(source.accepted ?? closedCandles.length),
+    closedAccepted: closedCandles.length,
+    rejectedCount: Number(source.rejectedCount ?? 0),
+    rejected: jsonSafe(source.rejected ?? []),
+    duplicatesRemoved: Number(source.duplicatesRemoved ?? 0),
+    gaps: jsonSafe(source.gaps ?? []),
+    unexpectedGaps: jsonSafe(source.unexpectedGaps ?? []),
+    warnings: jsonSafe(source.warnings ?? [])
+  };
+}
 
-  const lines = [
-    `SKY AI SIGNALS`,
-    `${symbol} | ${timeframe}`,
-    `Decision: ${setup.decision}`,
-    `Direction: ${direction}`,
-    `Score: ${setup.score ?? "N/A"}/${setup.maxScore ?? "N/A"}`,
-    `Confidence: ${setup.confidenceLabel ?? "N/A"}`,
-    `Trend: ${analysis.trend ?? "N/A"}`,
-    `Price: ${formatPrice(market.close)}`,
-    `Entry: ${formatPrice(levels.planned_entry)}`,
-    `Stop loss: ${formatPrice(levels.stop_loss)}`,
-    `Take profit: ${formatPrice(levels.take_profit)}`,
-    `Entry status: ${setup.entryStatus ?? "N/A"}`,
-    "",
-    "Reasons:",
-    ...(reasons.length
-      ? reasons.map(reason => `- ${String(reason)}`)
-      : ["- See chart annotations and analysis."]),
-    "",
-    "Potential setup only — confirm conditions before trading."
-  ];
-
-  return lines.join("\n");
+function buildErrorResult({
+  symbol,
+  timeframe,
+  message,
+  startedAt,
+  extra = {}
+}) {
+  return {
+    ok: false,
+    engineVersion: ENGINE_VERSION,
+    status: "DATA_ERROR",
+    symbol,
+    timeframe,
+    error: message,
+    processingMs: Date.now() - startedAt,
+    ...extra
+  };
 }
 
 /**
- * Run the analysis for one symbol and timeframe.
+ * Run the complete market-data + SMC + setup evaluation pipeline.
  *
- * Returns a JSON string so the existing Worker route can return it directly.
+ * @param {object} env Cloudflare Worker environment
+ * @param {string} symbolKey e.g. XAUUSD
+ * @param {string} tfKey e.g. M15
+ * @param {object} options Optional settings
+ * @returns {object} Structured signal result
  */
-export async function runSignalEngine(env, symbolKey = "XAUUSD", tfKey = "M15") {
+export async function getSignal(
+  env,
+  symbolKey = "XAUUSD",
+  tfKey = "M15",
+  options = {}
+) {
   const startedAt = Date.now();
 
+  if (!SYMBOLS[symbolKey]) {
+    return buildErrorResult({
+      symbol: symbolKey,
+      timeframe: tfKey,
+      message: `Unsupported symbol: ${symbolKey}`,
+      startedAt
+    });
+  }
+
+  if (!TIMEFRAMES[tfKey]) {
+    return buildErrorResult({
+      symbol: symbolKey,
+      timeframe: tfKey,
+      message: `Unsupported timeframe: ${tfKey}`,
+      startedAt
+    });
+  }
+
+  const requestedLimit = Number(options.limit);
+  const candleLimit = Number.isInteger(requestedLimit)
+    ? Math.max(50, Math.min(requestedLimit, 500))
+    : DEFAULT_CANDLE_LIMIT;
+
   try {
-    // 1. Validate symbol and timeframe.
-    if (!SYMBOLS[symbolKey]) {
-      return response(
-        "INVALID_SYMBOL",
-        `Unsupported symbol: ${symbolKey}`,
-        { supportedSymbols: Object.keys(SYMBOLS) }
-      );
-    }
-
-    if (!TIMEFRAMES[tfKey]) {
-      return response(
-        "INVALID_TIMEFRAME",
-        `Unsupported timeframe: ${tfKey}`,
-        { supportedTimeframes: Object.keys(TIMEFRAMES) }
-      );
-    }
-
-    // 2. Fetch market data using the actual biquote.js signature:
-    // getMarketData(env, symbolKey, tfKey, limit)
+    // 1. Fetch market data from your existing Biquote provider module.
     const market = await getMarketData(
       env,
       symbolKey,
       tfKey,
-      CANDLE_LIMIT
+      candleLimit
     );
 
-    if (!market || market.ok !== true || !Array.isArray(market.candles)) {
-      return response(
-        "MARKET_DATA_ERROR",
-        "The market-data provider did not return valid candles.",
-        {
-          symbol: symbolKey,
-          timeframe: tfKey,
-          provider: market?.provider ?? "unknown",
-          providerResponse: market ?? null
-        }
-      );
+    if (!market || market.ok !== true) {
+      return buildErrorResult({
+        symbol: symbolKey,
+        timeframe: tfKey,
+        message: market?.error || "Market data provider returned no valid data.",
+        startedAt,
+        extra: { provider: market?.provider ?? "unknown" }
+      });
     }
 
-    const candles = normalizeCandles(market.candles);
-    const closedCandles = getClosedCandles(candles);
-    const quality = market.quality ?? {};
+    // 2. Use only completed candles for technical analysis.
+    const closedCandles = getClosedCandles(market.candles);
 
-    if (closedCandles.length < MIN_CANDLES) {
-      return response(
-        "INSUFFICIENT_CANDLES",
-        `Need at least ${MIN_CANDLES} closed candles for analysis.`,
-        {
-          symbol: symbolKey,
-          timeframe: tfKey,
-          receivedCandles: candles.length,
-          closedCandles: closedCandles.length,
-          marketQuality: quality
-        }
-      );
+    const quality = getQuality(market, closedCandles);
+
+    const freshness = assessFreshness(
+      closedCandles,
+      tfKey,
+      Date.now()
+    );
+
+    const chartCandles = summarizeCandles(closedCandles);
+
+    const marketSummary = {
+      provider: market.provider ?? "unknown",
+      symbol: symbolKey,
+      timeframe: tfKey,
+      interval: market.interval ?? TIMEFRAMES[tfKey].interval,
+      fetchedAt: market.fetchedAt ?? new Date().toISOString(),
+      cached: Boolean(market.cached),
+
+      candleCount: Array.isArray(market.candles)
+        ? market.candles.length
+        : 0,
+
+      closedCandleCount: closedCandles.length,
+
+      latestClosedCandle: chartCandles.length
+        ? chartCandles[chartCandles.length - 1]
+        : null,
+
+      currentPrice: chartCandles.length
+        ? chartCandles[chartCandles.length - 1].close
+        : null,
+
+      // Chart needs these real, completed market candles.
+      candles: chartCandles,
+
+      quality,
+      freshness
+    };
+
+    // 3. Refuse to manufacture a signal from insufficient data.
+    if (closedCandles.length < MIN_CLOSED_CANDLES) {
+      return {
+        ok: false,
+        engineVersion: ENGINE_VERSION,
+        status: "INSUFFICIENT_DATA",
+        symbol: symbolKey,
+        symbolName: SYMBOLS[symbolKey].name,
+        timeframe: tfKey,
+        market: marketSummary,
+        signal: {
+          decision: "NO_TRADE",
+          direction: null,
+          score: 0,
+          maxScore: null,
+          confidenceLabel: "INSUFFICIENT_DATA",
+          reasons: [
+            `Only ${closedCandles.length} valid closed candles are available.`,
+            `At least ${MIN_CLOSED_CANDLES} are required by this engine wrapper.`
+          ],
+          evidence: [],
+          candidateZone: null,
+          levels: null,
+          entryStatus: "NOT_EVALUATED"
+        },
+        analysis: null,
+        annotations: [],
+        processingMs: Date.now() - startedAt
+      };
     }
 
-    // 3. Freshness check. If the helper throws or returns an unknown shape,
-    // do not silently assume that the market data is fresh.
-    let freshness;
-
-    try {
-      freshness = assessFreshness(candles, tfKey, Date.now());
-    } catch (error) {
-      return response(
-        "FRESHNESS_CHECK_ERROR",
-        "Could not verify market-data freshness.",
-        { error: error?.message || String(error) }
-      );
-    }
-
-    // 4. Block data with clearly excessive gaps.
-    const unexpectedGaps = getUnexpectedGapCount(quality);
-
-    if (unexpectedGaps > MAX_UNEXPECTED_GAPS) {
-      return response(
-        "DATA_QUALITY_BLOCK",
-        "Analysis stopped because the feed contains too many unexpected candle gaps.",
-        {
-          symbol: symbolKey,
-          timeframe: tfKey,
-          unexpectedGaps,
-          marketQuality: quality,
-          freshness
-        }
-      );
-    }
-
-    // The freshness helper's exact result shape can vary. Inspect its
-    // returned fields conservatively and block only explicit stale/error
-    // states, not a normal weekend market-closed state.
-    const freshnessText = JSON.stringify(freshness ?? {}).toLowerCase();
-
-    const explicitlyStale =
-      freshness?.ok === false ||
-      freshness?.stale === true ||
-      freshness?.status === "stale" ||
-      freshness?.state === "stale" ||
-      freshnessText.includes('"status":"stale"') ||
-      freshnessText.includes('"state":"stale"');
-
-    if (explicitlyStale) {
-      return response(
-        "STALE_MARKET_DATA",
-        "The latest market data is stale. No signal was generated.",
-        {
-          symbol: symbolKey,
-          timeframe: tfKey,
-          freshness,
-          lastClosedCandle: candleSummary(closedCandles)
-        }
-      );
-    }
-
-    // 5. Run SMC analysis using closed candles only.
+    // 4. Run the existing SMC analysis.
     const analysis = analyze(closedCandles, tfKey);
 
     if (!analysis || analysis.ok !== true) {
-      return response(
-        "ANALYSIS_FAILED",
-        "The SMC analysis could not produce a valid analysis.",
-        {
-          symbol: symbolKey,
-          timeframe: tfKey,
-          analysis: analysis ?? null,
-          marketQuality: quality
+      return buildErrorResult({
+        symbol: symbolKey,
+        timeframe: tfKey,
+        message: analysis?.error ||
+          "SMC analysis failed or returned an invalid result.",
+        startedAt,
+        extra: {
+          market: marketSummary,
+          analysis: jsonSafe(analysis)
         }
-      );
+      });
     }
 
-    const latestCandle = closedCandles[closedCandles.length - 1];
-    const currentPrice = latestCandle.close;
+    // 5. Evaluate the setup against the latest closed candle price.
+    const currentPrice =
+      chartCandles[chartCandles.length - 1].close;
 
-    // 6. Evaluate the setup.
     const setup = evaluateSetup(analysis, currentPrice);
 
     if (!setup || typeof setup !== "object") {
-      return response(
-        "DECISION_FAILED",
-        "The setup evaluator returned no valid decision.",
-        {
-          symbol: symbolKey,
-          timeframe: tfKey,
-          currentPrice
+      return buildErrorResult({
+        symbol: symbolKey,
+        timeframe: tfKey,
+        message: "Setup evaluator returned no valid result.",
+        startedAt,
+        extra: {
+          market: marketSummary,
+          analysis: jsonSafe(analysis)
         }
-      );
+      });
     }
 
-    // 7. Build chart annotations even when there is no trade setup.
-    // The frontend can draw these over the corresponding candles.
-    const annotations = buildChartAnnotations(analysis, setup);
+    // 6. Create annotations for the frontend chart.
+    const annotations = buildChartAnnotations(
+      analysis,
+      setup
+    );
+
+    const decision = setup.decision ?? "NO_TRADE";
 
     const result = {
       ok: true,
       engineVersion: ENGINE_VERSION,
-      status: setup.decision === "NO_TRADE" ? "NO_TRADE" : "SETUP_FOUND",
+
+      status: decision === "NO_TRADE"
+        ? "NO_TRADE"
+        : "SETUP_FOUND",
+
       symbol: symbolKey,
       symbolName: SYMBOLS[symbolKey].name,
       timeframe: tfKey,
+
       provider: market.provider ?? "unknown",
       fetchedAt: market.fetchedAt ?? null,
-      cached: market.cached ?? false,
+      cached: Boolean(market.cached),
       processingMs: Date.now() - startedAt,
 
-      market: {
-        candleCount: candles.length,
-        closedCandleCount: closedCandles.length,
-        latestClosedCandle: candleSummary(closedCandles),
-        currentPrice,
-        quality,
-        freshness
-      },
+      market: marketSummary,
 
-      analysis,
-      setup,
-      annotations: Array.isArray(annotations) ? annotations : [],
+      // Detailed SMC evidence: structure, sweeps, OBs, FVGs, etc.
+      analysis: jsonSafe(analysis),
+
+      setup: jsonSafe(setup),
+
+      annotations: Array.isArray(annotations)
+        ? jsonSafe(annotations)
+        : [],
+
       signal: {
-        decision: setup.decision ?? "NO_TRADE",
+        decision,
         direction: setup.direction ?? null,
         score: setup.score ?? null,
         maxScore: setup.maxScore ?? null,
         confidenceLabel: setup.confidenceLabel ?? null,
-        reasons: Array.isArray(setup.reasons) ? setup.reasons : [],
-        evidence: setup.evidence ?? [],
-        candidateZone: setup.candidateZone ?? null,
-        levels: setup.levels ?? null,
+
+        reasons: Array.isArray(setup.reasons)
+          ? jsonSafe(setup.reasons)
+          : [],
+
+        evidence: Array.isArray(setup.evidence)
+          ? jsonSafe(setup.evidence)
+          : [],
+
+        candidateZone: jsonSafe(setup.candidateZone ?? null),
+        levels: jsonSafe(setup.levels ?? null),
         entryStatus: setup.entryStatus ?? null
       }
     };
 
-    // 8. Do not notify for NO_TRADE decisions.
-    if (setup.decision === "NO_TRADE" || !setup.direction || !setup.levels) {
-      return json(result);
-    }
-
-    // 9. Duplicate protection.
-    const signalId = buildSignalId(
-      symbolKey,
-      tfKey,
-      setup,
-      latestCandle
-    );
-
-    const dedupeKey = `last_signal:${symbolKey}:${tfKey}`;
-    const previousSignalId = await readKV(env, dedupeKey);
-
-    if (previousSignalId === signalId) {
-      result.notification = {
-        sent: false,
-        duplicate: true,
-        reason: "This setup was already processed."
-      };
-
-      return json(result);
-    }
-
-    // 10. Store a pending setup for the frontend/backend to track.
-    // This does NOT mean a position was opened or that entry was reached.
-    const pendingKey = `pending_setup:${signalId}`;
-
-    const pendingSetup = {
-      signalId,
-      symbol: symbolKey,
-      timeframe: tfKey,
-      direction: setup.direction,
-      decision: setup.decision,
-      score: setup.score,
-      confidenceLabel: setup.confidenceLabel,
-      candidateZone: setup.candidateZone ?? null,
-      levels: setup.levels,
-      entryStatus: setup.entryStatus ?? "WAITING_FOR_ENTRY",
-      status: "WAITING_FOR_ENTRY",
-      createdAt: new Date().toISOString(),
-      lastClosedCandleTime: latestCandle.time
-    };
-
-    if (env.SKY_MEMORY) {
-      const existingPending = await readKV(env, pendingKey);
-
-      if (!existingPending) {
-        await writeKV(env, pendingKey, JSON.stringify(pendingSetup), {
-          expirationTtl: DEDUPE_TTL_SECONDS
-        });
-      }
-    }
-
-    // 11. Send Telegram if credentials are configured.
-    // Only mark the signal as processed after notification succeeds,
-    // or when Telegram is not configured.
-    const telegramMessage = formatTelegramSignal(
-      symbolKey,
-      tfKey,
-      setup,
-      { close: currentPrice },
-      analysis
-    );
-
-    const notification = await sendTelegram(env, telegramMessage);
-
-    result.notification = notification;
-    result.signalId = signalId;
-    result.pendingSetup = pendingSetup;
-
-    if (notification.sent || notification.configured === false) {
-      await writeKV(
-        env,
-        dedupeKey,
-        signalId,
-        { expirationTtl: DEDUPE_TTL_SECONDS }
-      );
-    }
-
-    return json(result);
+    return result;
 
   } catch (error) {
-    return response(
-      "ENGINE_ERROR",
-      error?.message || "Unexpected signal-engine error.",
-      {
-        symbol: symbolKey,
-        timeframe: tfKey,
-        processingMs: Date.now() - startedAt
-      }
-    );
+    console.error("SKY AI SIGNAL ENGINE ERROR", {
+      symbol: symbolKey,
+      timeframe: tfKey,
+      message: error?.message,
+      stack: error?.stack
+    });
+
+    return buildErrorResult({
+      symbol: symbolKey,
+      timeframe: tfKey,
+      message: error?.message || "Unexpected signal engine error.",
+      startedAt
+    });
   }
 }
+
+/**
+ * Compatibility wrapper for the existing Worker.
+ * Returns JSON text because the previous Worker used
+ * new Response(resultText, { ... }).
+ */
+export async function runSignalEngine(
+  env,
+  symbolKey = "XAUUSD",
+  tfKey = "M15"
+) {
+  const result = await getSignal(env, symbolKey, tfKey);
+  return JSON.stringify(result);
+      }
