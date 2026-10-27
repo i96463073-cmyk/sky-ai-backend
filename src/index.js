@@ -1,6 +1,9 @@
 import { runAgent } from "./agent.js";
 import { handleApi } from "./api.js";
 import { runSignalEngine } from "./engine.js";
+import { SYMBOLS } from "./market/symbols.js";
+
+const DEFAULT_TIMEFRAME = "M15";
 
 export default {
   async fetch(request, env, ctx) {
@@ -12,41 +15,137 @@ export default {
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     };
 
+    const jsonResponse = (data, status = 200) =>
+      new Response(
+        typeof data === "string" ? data : JSON.stringify(data),
+        {
+          status,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json; charset=UTF-8",
+          },
+        }
+      );
+
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
     }
 
-    // Route: /api/*
+    // Existing API routes.
     if (url.pathname.startsWith("/api/")) {
       return handleApi(request, env);
     }
 
-    // Route: /chat
+    // Existing AI chat route.
     if (url.pathname === "/chat" && request.method === "POST") {
-      const body = await request.json();
-      const result = await runAgent(env, "user", body.message);
-      return new Response(JSON.stringify(result), { 
-        headers: { ...corsHeaders, "Content-Type": "application/json" } 
+      try {
+        const body = await request.json();
+
+        if (!body || typeof body.message !== "string") {
+          return jsonResponse(
+            { ok: false, error: "A message is required." },
+            400
+          );
+        }
+
+        const result = await runAgent(env, "user", body.message);
+        return jsonResponse(result);
+      } catch (error) {
+        return jsonResponse(
+          {
+            ok: false,
+            error: error?.message || "Chat request failed.",
+          },
+          500
+        );
+      }
+    }
+
+    // Test a selected pair and timeframe.
+    // Example: /test-signal?symbol=EURUSD&timeframe=M15
+    if (url.pathname === "/test-signal" && request.method === "GET") {
+      const symbol = (
+        url.searchParams.get("symbol") || "XAUUSD"
+      ).toUpperCase();
+
+      const timeframe = (
+        url.searchParams.get("timeframe") || DEFAULT_TIMEFRAME
+      ).toUpperCase();
+
+      if (!SYMBOLS[symbol]) {
+        return jsonResponse(
+          {
+            ok: false,
+            error: "Unsupported symbol.",
+            supportedSymbols: Object.keys(SYMBOLS),
+          },
+          400
+        );
+      }
+
+      try {
+        const result = await runSignalEngine(
+          env,
+          symbol,
+          timeframe
+        );
+
+        return jsonResponse(result);
+      } catch (error) {
+        return jsonResponse(
+          {
+            ok: false,
+            symbol,
+            timeframe,
+            error: error?.message || "Signal check failed.",
+          },
+          500
+        );
+      }
+    }
+
+    // Health check.
+    if (url.pathname === "/" || url.pathname === "/health") {
+      return jsonResponse({
+        status: "online",
+        service: "SKY AI SIGNALS",
+        supportedSymbols: Object.keys(SYMBOLS),
+        defaultTimeframe: DEFAULT_TIMEFRAME,
       });
     }
 
-    // Route: /test-signal (Now prints result to screen)
-    if (url.pathname === "/test-signal") {
-      const resultText = await runSignalEngine(env, "XAUUSD", "M15");
-      return new Response(resultText, { 
-        headers: { ...corsHeaders, "Content-Type": "text/plain; charset=UTF-8" } 
-      });
-    }
-
-    // Health Check
-    return new Response(JSON.stringify({ status: "online", version: "1.0.0" }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" }
-    });
+    return jsonResponse(
+      { ok: false, error: "Route not found." },
+      404
+    );
   },
 
-  // CRON TRIGGER (Runs automatically)
+  // Scheduled signal checks for all supported pairs.
   async scheduled(event, env, ctx) {
-    // This will run in the background without displaying to a screen
-    ctx.waitUntil(runSignalEngine(env, "XAUUSD", "M15"));
-  }
+    ctx.waitUntil(
+      (async () => {
+        const symbols = Object.keys(SYMBOLS);
+
+        // Run sequentially to avoid sending all provider requests
+        // simultaneously.
+        for (const symbol of symbols) {
+          try {
+            await runSignalEngine(
+              env,
+              symbol,
+              DEFAULT_TIMEFRAME
+            );
+          } catch (error) {
+            console.error(
+              `Signal check failed for ${symbol}:`,
+              error?.message || error
+            );
+          }
+        }
+      })()
+    );
+  },
 };
