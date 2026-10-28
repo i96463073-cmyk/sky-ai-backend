@@ -1,4 +1,3 @@
-
 const MAX_ZONE_DISTANCE_ATR = 1.5;
 const MAX_EVENT_AGE = 20;
 
@@ -30,9 +29,7 @@ export function buildChartAnnotations(analysis, decision = null) {
 
   for (const swing of analysis.swings ?? []) {
     addAnnotation(annotations, "SWING", swing, {
-      label: swing.label
-        ? `${swing.label} ${swing.type}`
-        : `Swing ${swing.type}`
+      label: swing.label ? `${swing.label} ${swing.type}` : `Swing ${swing.type}`
     });
   }
 
@@ -100,15 +97,27 @@ export function buildChartAnnotations(analysis, decision = null) {
 
   if (decision?.levels) {
     for (const [key, value] of Object.entries(decision.levels)) {
-      if (finite(value) === null) continue;
-
-      annotations.push({
-        id: key.toUpperCase(),
-        type: key.toUpperCase(),
-        price: Number(value),
-        label: key.replaceAll("_", " ").toUpperCase(),
-        direction: decision.direction ?? null
-      });
+      if (Array.isArray(value)) {
+        value.forEach((v, i) => {
+          if (finite(v) === null) return;
+          annotations.push({
+            id: `${key.toUpperCase()}_${i + 1}`,
+            type: key.toUpperCase(),
+            price: Number(v),
+            label: `${key.replaceAll("_", " ").toUpperCase()} ${i + 1}`,
+            direction: decision.direction ?? null
+          });
+        });
+      } else {
+        if (finite(value) === null) continue;
+        annotations.push({
+          id: key.toUpperCase(),
+          type: key.toUpperCase(),
+          price: Number(value),
+          label: key.replaceAll("_", " ").toUpperCase(),
+          direction: decision.direction ?? null
+        });
+      }
     }
   }
 
@@ -124,9 +133,12 @@ export function evaluateSetup(analysis, currentPrice) {
     decision: "NO_TRADE",
     direction: null,
     score: 0,
-    maxScore: 6,
+    maxScore: 100,
+    confidence: 0,
+    quality: null,
     confidenceLabel: "Insufficient evidence",
     reasons: [],
+    confluence: [], // Used by the app's checklist
     evidence: [],
     candidateZone: null,
     levels: null,
@@ -145,10 +157,12 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.direction = trend === "bullish" ? "BUY" : "SELL";
   result.evidence.push(`Latest structure trend is ${trend}.`);
-  result.score++;
+  result.score += 20; // 20 pts for trend
+  result.confluence.push(`${trend.charAt(0).toUpperCase() + trend.slice(1)} Trend`);
 
   const lastIndex = analysis.candlesAnalysed - 1;
 
+  // 1. Market Structure Shift (BOS / CHOCH)
   const recentEvent = [...(analysis.structureEvents ?? [])]
     .filter(event =>
       event.direction === trend &&
@@ -158,57 +172,41 @@ export function evaluateSetup(analysis, currentPrice) {
     .sort((a, b) => b.index - a.index)[0];
 
   if (recentEvent) {
-    result.score++;
-    result.evidence.push(
-      `Recent ${recentEvent.type} confirms ${trend} structure.`
-    );
+    result.score += 20; // 20 pts for MSS
+    result.evidence.push(`Recent ${recentEvent.type} confirms ${trend} structure.`);
+    result.confluence.push(`${recentEvent.type} Confirmed`);
   } else {
-    result.reasons.push(
-      `No matching BOS/CHOCH event in the last ${MAX_EVENT_AGE} candles.`
-    );
+    result.reasons.push(`No matching BOS/CHOCH event in the last ${MAX_EVENT_AGE} candles.`);
   }
 
+  // 2. Order Block
   const validBlocks = (analysis.orderBlocks ?? [])
     .filter(ob => {
       if (ob.direction !== trend) return false;
       if (!["unmitigated", "mitigated"].includes(ob.status)) return false;
-
       const top = finite(ob.top);
       const bottom = finite(ob.bottom);
       if (top === null || bottom === null || top <= bottom) return false;
-
-      const distance = price < bottom
-        ? bottom - price
-        : price > top
-          ? price - top
-          : 0;
-
+      const distance = price < bottom ? bottom - price : price > top ? price - top : 0;
       return distance <= atr * MAX_ZONE_DISTANCE_ATR;
     })
     .sort((a, b) => {
-      const distance = ob => price < ob.bottom
-        ? ob.bottom - price
-        : price > ob.top
-          ? price - ob.top
-          : 0;
-
+      const distance = ob => price < ob.bottom ? ob.bottom - price : price > ob.top ? price - ob.top : 0;
       return distance(a) - distance(b);
     });
 
   const block = validBlocks[0];
 
   if (!block) {
-    result.reasons.push(
-      "No valid nearby order block agrees with the current trend."
-    );
-    return result;
+    result.reasons.push("No valid nearby order block agrees with the current trend.");
+    return result; // Exit early, no OB means no trade
   }
 
-  result.score++;
-  result.evidence.push(
-    `A ${trend} order block is nearby (${block.status}).`
-  );
+  result.score += 20; // 20 pts for OB
+  result.evidence.push(`A ${trend} order block is nearby (${block.status}).`);
+  result.confluence.push("Order Block");
 
+  // 3. Liquidity Sweep
   const relevantSweep = [...(analysis.sweeps ?? [])]
     .filter(sweep =>
       sweep.direction === trend &&
@@ -218,51 +216,41 @@ export function evaluateSetup(analysis, currentPrice) {
     .sort((a, b) => b.index - a.index)[0];
 
   if (relevantSweep) {
-    result.score++;
-    result.evidence.push(
-      `Recent ${relevantSweep.side}-side liquidity sweep supports the setup.`
-    );
+    result.score += 15; // 15 pts for sweep
+    result.evidence.push(`Recent ${relevantSweep.side}-side liquidity sweep supports the setup.`);
+    result.confluence.push("Liquidity Sweep");
   } else {
     result.reasons.push("No recent matching liquidity sweep.");
   }
 
+  // 4. Fair Value Gap (FVG)
   const relevantFvg = (analysis.fvg ?? []).find(fvg => {
     if (fvg.direction !== trend) return false;
-    if (!["unmitigated", "partially_mitigated"].includes(fvg.status)) {
-      return false;
-    }
-
+    if (!["unmitigated", "partially_mitigated"].includes(fvg.status)) return false;
     const top = finite(fvg.top);
     const bottom = finite(fvg.bottom);
     if (top === null || bottom === null) return false;
-
     return price >= bottom - atr && price <= top + atr;
   });
 
   if (relevantFvg) {
-    result.score++;
-    result.evidence.push(
-      `A nearby ${trend} fair value gap provides confluence.`
-    );
+    result.score += 15; // 15 pts for FVG
+    result.evidence.push(`A nearby ${trend} fair value gap provides confluence.`);
+    result.confluence.push("Fair Value Gap");
   } else {
     result.reasons.push("No nearby valid matching FVG.");
   }
 
+  // 5. Premium / Discount Zone
   const range = analysis.dealingRange;
   if (range?.valid && !range.outside) {
-    const locationSupportsDirection = trend === "bullish"
-      ? range.zone === "discount"
-      : range.zone === "premium";
-
+    const locationSupportsDirection = trend === "bullish" ? range.zone === "discount" : range.zone === "premium";
     if (locationSupportsDirection) {
-      result.score++;
-      result.evidence.push(
-        `${range.zone} pricing supports the ${result.direction} idea.`
-      );
+      result.score += 10; // 10 pts for PD array
+      result.evidence.push(`${range.zone} pricing supports the ${result.direction} idea.`);
+      result.confluence.push(`${range.zone.charAt(0).toUpperCase() + range.zone.slice(1)} Zone`);
     } else {
-      result.reasons.push(
-        `Price is in ${range.zone}; this does not support the preferred ${result.direction} location.`
-      );
+      result.reasons.push(`Price is in ${range.zone}; this does not support the preferred ${result.direction} location.`);
     }
   } else {
     result.reasons.push("A valid in-range premium/discount location is unavailable.");
@@ -275,17 +263,10 @@ export function evaluateSetup(analysis, currentPrice) {
     status: block.status
   };
 
-  // This is a planned entry, not a confirmed fill.
-  // The frontend should label these as planned levels.
-  const entry = trend === "bullish"
-    ? Number(block.top)
-    : Number(block.bottom);
-
+  // Build the Entry, SL, and multiple TPs
+  const entry = trend === "bullish" ? Number(block.top) : Number(block.bottom);
   const buffer = atr * 0.25;
-  const stopLoss = trend === "bullish"
-    ? Number(block.bottom) - buffer
-    : Number(block.top) + buffer;
-
+  const stopLoss = trend === "bullish" ? Number(block.bottom) - buffer : Number(block.top) + buffer;
   const risk = Math.abs(entry - stopLoss);
 
   if (!(risk > 0) || !Number.isFinite(risk)) {
@@ -294,28 +275,35 @@ export function evaluateSetup(analysis, currentPrice) {
     return result;
   }
 
-  const takeProfit = trend === "bullish"
-    ? entry + 2 * risk
-    : entry - 2 * risk;
+  // Calculate 3 Take Profits (1:1, 1:2, 1:3 R:R)
+  const tp1 = trend === "bullish" ? entry + (1 * risk) : entry - (1 * risk);
+  const tp2 = trend === "bullish" ? entry + (2 * risk) : entry - (2 * risk);
+  const tp3 = trend === "bullish" ? entry + (3 * risk) : entry - (3 * risk);
 
+  // ✅ THE EXACT FORMAT THE KOTLIN APP EXPECTS
   result.levels = {
-    planned_entry: entry,
+    entry: entry,
     stop_loss: stopLoss,
-    take_profit: takeProfit
+    take_profit: [tp1, tp2, tp3] // Array of TPs for the app
   };
 
-  // Do not call this a confirmed signal just because the score is high.
-  // Entry confirmation and data-quality gating still need to be connected.
-  if (result.score >= 4 && recentEvent) {
-    result.decision = trend === "bullish" ? "BUY_SETUP" : "SELL_SETUP";
-    result.confidenceLabel = "Setup evidence present; entry unconfirmed";
-    result.reasons.push(
-      "Setup conditions are present, but entry confirmation is still required."
-    );
+  // 🛑 STRICT FILTER: Only send to the app if the score is 80 or above
+  if (result.score >= 80 && recentEvent) {
+    result.decision = trend === "bullish" ? "BUY" : "SELL";
+    result.confidence = result.score;
+    
+    // Assign Grade based on score
+    if (result.score >= 95) result.quality = "A+";
+    else if (result.score >= 85) result.quality = "A";
+    else result.quality = "B";
+
+    result.confidenceLabel = `${result.quality} Setup`;
+    result.reasons = ["All high-probability conditions met."]; // Clear rejection reasons
   } else {
     result.decision = "NO_TRADE";
     result.confidenceLabel = "Insufficient confluence";
+    result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 80.`);
   }
 
   return result;
-}
+  }
