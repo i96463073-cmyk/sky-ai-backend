@@ -3,7 +3,7 @@ import { getMarketData, assessFreshness, providerState } from "./market/biquote.
 import { analyze } from "./smc/analyze.js";
 import { ENGINE_VERSION } from "./smc/config.js";
 
-export const API_VERSION = "signals-api-0.2.0";
+export const API_VERSION = "signals-api-0.2.1";
 
 const HEADERS = {
   "Content-Type": "application/json; charset=UTF-8",
@@ -20,18 +20,33 @@ export async function handleApi(request, env = {}) {
   
   const url = new URL(request.url);
 
-  // NEW ROUTE: Send pending and completed signals to the Android App
-  if (url.pathname === "/api/signals") {
+  // UPDATED ROUTE: Handles both /api/live and /api/signals
+  if (url.pathname === "/api/signals" || url.pathname === "/api/live") {
     if (!env.SKY_MEMORY) return fail(500, "NO_DB", "Database not configured");
     
-    const pending = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
+    // 1. Fetch raw data
+    const pendingRaw = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
     const completed = JSON.parse(await env.SKY_MEMORY.get("completed_trades") || "[]");
     
-    // Sort newest first
-    pending.sort((a, b) => b.created_at.localeCompare(a.created_at));
-    completed.sort((a, b) => b.closed_at.localeCompare(a.closed_at));
+    // 2. Filter out trades older than 12 hours
+    const now = Date.now();
+    const pending = pendingRaw.filter(sig => {
+      const timeStr = sig.created_at || sig.time;
+      if (!timeStr) return true; // Keep if no date is found
+      const ageMs = now - new Date(timeStr).getTime();
+      return ageMs < (12 * 60 * 60 * 1000); // 12 hours in milliseconds
+    });
+    
+    // 3. Sort newest first
+    pending.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+    completed.sort((a, b) => (b.closed_at || "").localeCompare(a.closed_at || ""));
 
-    return reply({ ok: true, pending, completed });
+    // 4. Fetch live prices and news (so the top ticker populates)
+    const live_prices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
+    const news = JSON.parse(await env.SKY_MEMORY.get("news") || "[]");
+
+    // 5. Return the exact format the app expects
+    return reply({ ok: true, live_prices, pending, completed, news });
   }
 
   if (url.pathname === "/api/analysis") {
@@ -49,4 +64,4 @@ export async function handleApi(request, env = {}) {
   }
 
   return fail(404, "NOT_FOUND", "Unknown API route");
-}
+      }
