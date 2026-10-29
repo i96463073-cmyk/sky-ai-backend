@@ -1,26 +1,17 @@
 import { handleApi } from "./api.js";
 import { getSignal } from "./engine.js";
-import { SYMBOLS } from "./market/symbols.js";
+import { getMarketData } from "./market/biquote.js";
 
 // 📨 Helper function to send messages to Telegram
 async function sendTelegramMessage(env, message) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    console.log("Telegram credentials missing. Skipping notification.");
-    return;
-  }
-
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
-    const response = await fetch(url, {
+    await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: env.TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: "HTML"
-      })
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" })
     });
-    if (!response.ok) console.error("Telegram Error:", await response.text());
   } catch (e) {
     console.error("Failed to send Telegram message:", e);
   }
@@ -30,9 +21,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     
-    if (url.pathname.startsWith("/api/")) {
-      return handleApi(request, env);
-    }
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env);
     
     if (url.pathname === "/test-signal") {
       const symbol = url.searchParams.get("symbol") || "XAUUSD";
@@ -48,27 +37,35 @@ export default {
     console.log("Cron Job Started: Scanning pairs...");
     
     let pendingTrades = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
+    let livePrices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
     
-    // We will scan these pairs and timeframes
     const symbolsToScan = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"];
     const timeframes = ["M15", "H1"];
 
     for (const symbol of symbolsToScan) {
+      
+      // 🟢 1. FETCH LIVE PRICES FOR THE TICKER & PIPS
+      try {
+        const marketData = await getMarketData(env, symbol, "M15", 1);
+        if (marketData && marketData.ok && marketData.candles && marketData.candles.length > 0) {
+          livePrices[symbol] = marketData.candles[marketData.candles.length - 1].close;
+        }
+      } catch (e) {
+        console.error(`Error fetching price for ${symbol}:`, e);
+      }
+
+      // 🔍 2. SCAN FOR SIGNALS
       for (const tf of timeframes) {
         try {
           const res = await getSignal(env, symbol, tf);
           
-          // If a valid BUY or SELL is found (Score >= 40 from decision.js)
           if (res.ok && res.signal && (res.signal.decision === "BUY" || res.signal.decision === "SELL")) {
-            
-            // Check if we already have this active trade saved in the app
             const exists = pendingTrades.find(t => t.symbol === symbol && t.timeframe === tf);
             if (exists) continue;
 
             const levels = res.signal.levels;
             const isBuy = res.signal.decision === "BUY";
 
-            // 1. Create the trade object for the App
             const newTrade = {
               id: "sig_" + Date.now() + "_" + Math.floor(Math.random()*1000),
               symbol: symbol,
@@ -83,14 +80,11 @@ export default {
               timeframe: tf
             };
 
-            // 2. Save to Database for the App (All signals >= 40 go here)
             pendingTrades.push(newTrade);
-            console.log(`✅ Saved to App DB: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
+            console.log(`✅ Found: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
 
-            // 3. Send to Telegram ONLY if Confidence >= 70%
+            // 3. Send to Telegram ONLY if >= 70%
             if (newTrade.confidence >= 70) {
-              console.log(`📨 Sending high-quality signal to Telegram: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
-              
               const tgMessage = `
 🚨 <b>SKY AI SIGNAL (${newTrade.confidence}%)</b> 🚨
 <b>Pair:</b> ${symbol} (${tf})
@@ -99,18 +93,11 @@ export default {
 -----------------------------------
 <b>Entry:</b> ${levels.entry.toFixed(5)}
 <b>Stop Loss:</b> ${levels.stop_loss.toFixed(5)}
-
 <b>TP1:</b> ${levels.take_profit[0].toFixed(5)}
 <b>TP2:</b> ${levels.take_profit[1].toFixed(5)}
 <b>TP3:</b> ${levels.take_profit[2].toFixed(5)}
------------------------------------
-<b>Confluence:</b>
-${newTrade.confluence.map(c => `• ${c}`).join('\n')}
               `.trim();
-
               await sendTelegramMessage(env, tgMessage);
-            } else {
-              console.log(`🤫 Skipping Telegram for ${symbol} ${tf} (Score: ${newTrade.confidence}% is below 70%).`);
             }
           }
         } catch (e) {
@@ -119,9 +106,13 @@ ${newTrade.confluence.map(c => `• ${c}`).join('\n')}
       }
     }
 
-    // Save updated list to DB (Keep only the latest 30)
+    // Keep DB clean
     pendingTrades = pendingTrades.slice(-30); 
+    
+    // Save BOTH signals and live prices to the database
     await env.SKY_MEMORY.put("pending_trades", JSON.stringify(pendingTrades));
-    console.log(`Cron Job Finished. Active trades in app: ${pendingTrades.length}`);
+    await env.SKY_MEMORY.put("live_prices", JSON.stringify(livePrices));
+    
+    console.log(`Cron Job Finished. Active trades: ${pendingTrades.length}, Prices updated: ${Object.keys(livePrices).length}`);
   }
 };
