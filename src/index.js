@@ -2,7 +2,6 @@ import { handleApi } from "./api.js";
 import { getSignal } from "./engine.js";
 import { getMarketData } from "./market/biquote.js";
 
-// 📨 Helper function to send messages to Telegram
 async function sendTelegramMessage(env, message) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -20,16 +19,13 @@ async function sendTelegramMessage(env, message) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    
     if (url.pathname.startsWith("/api/")) return handleApi(request, env);
-    
     if (url.pathname === "/test-signal") {
       const symbol = url.searchParams.get("symbol") || "XAUUSD";
       const timeframe = url.searchParams.get("timeframe") || "M15";
       const result = await getSignal(env, symbol, timeframe);
       return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
     }
-
     return new Response("Sky AI Backend is running.", { status: 200 });
   },
 
@@ -43,8 +39,7 @@ export default {
     const timeframes = ["M15", "H1"];
 
     for (const symbol of symbolsToScan) {
-      
-      // 🟢 1. FETCH LIVE PRICES FOR THE TICKER & PIPS
+      // 1. Fetch live prices for Ticker & Pips
       try {
         const marketData = await getMarketData(env, symbol, "M15", 1);
         if (marketData && marketData.ok && marketData.candles && marketData.candles.length > 0) {
@@ -54,7 +49,7 @@ export default {
         console.error(`Error fetching price for ${symbol}:`, e);
       }
 
-      // 🔍 2. SCAN FOR SIGNALS
+      // 2. Scan for signals
       for (const tf of timeframes) {
         try {
           const res = await getSignal(env, symbol, tf);
@@ -83,7 +78,7 @@ export default {
             pendingTrades.push(newTrade);
             console.log(`✅ Found: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
 
-            // 3. Send to Telegram ONLY if >= 70%
+            // 3. Send to Telegram ONLY if Confidence >= 70%
             if (newTrade.confidence >= 70) {
               const tgMessage = `
 🚨 <b>SKY AI SIGNAL (${newTrade.confidence}%)</b> 🚨
@@ -106,13 +101,11 @@ export default {
       }
     }
 
-    // Keep DB clean
     pendingTrades = pendingTrades.slice(-30); 
     
-    // Save BOTH signals and live prices to the database
     await env.SKY_MEMORY.put("pending_trades", JSON.stringify(pendingTrades));
     await env.SKY_MEMORY.put("live_prices", JSON.stringify(livePrices));
     
-    console.log(`Cron Job Finished. Active trades: ${pendingTrades.length}, Prices updated: ${Object.keys(livePrices).length}`);
+    console.log(`Cron Job Finished. Active: ${pendingTrades.length}, Prices: ${Object.keys(livePrices).length}`);
   }
 };
