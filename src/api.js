@@ -20,7 +20,6 @@ export async function handleApi(request, env = {}) {
   
   const url = new URL(request.url);
 
-  // UPDATED ROUTE: Handles both /api/live and /api/signals
   if (url.pathname === "/api/signals" || url.pathname === "/api/live") {
     if (!env.SKY_MEMORY) return fail(500, "NO_DB", "Database not configured");
     
@@ -32,16 +31,16 @@ export async function handleApi(request, env = {}) {
     const now = Date.now();
     const pending = pendingRaw.filter(sig => {
       const timeStr = sig.created_at || sig.time;
-      if (!timeStr) return true; // Keep if no date is found
+      if (!timeStr) return true; 
       const ageMs = now - new Date(timeStr).getTime();
-      return ageMs < (12 * 60 * 60 * 1000); // 12 hours in milliseconds
+      return ageMs < (12 * 60 * 60 * 1000); 
     });
     
     // 3. Sort newest first
     pending.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
     completed.sort((a, b) => (b.closed_at || "").localeCompare(a.closed_at || ""));
 
-    // 4. Fetch live prices and news (so the top ticker populates)
+    // 4. Fetch live prices and news (THIS FILLS THE TICKER AND PIPS)
     const live_prices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
     const news = JSON.parse(await env.SKY_MEMORY.get("news") || "[]");
 
@@ -64,4 +63,4 @@ export async function handleApi(request, env = {}) {
   }
 
   return fail(404, "NOT_FOUND", "Unknown API route");
-      }
+                 }
