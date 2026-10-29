@@ -98,6 +98,7 @@ export function buildChartAnnotations(analysis, decision = null) {
   if (decision?.levels) {
     for (const [key, value] of Object.entries(decision.levels)) {
       if (Array.isArray(value)) {
+        // Handle multiple take profits
         value.forEach((v, i) => {
           if (finite(v) === null) return;
           annotations.push({
@@ -138,7 +139,7 @@ export function evaluateSetup(analysis, currentPrice) {
     quality: null,
     confidenceLabel: "Insufficient evidence",
     reasons: [],
-    confluence: [], // Used by the app's checklist
+    confluence: [],
     evidence: [],
     candidateZone: null,
     levels: null,
@@ -157,12 +158,12 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.direction = trend === "bullish" ? "BUY" : "SELL";
   result.evidence.push(`Latest structure trend is ${trend}.`);
-  result.score += 20; // 20 pts for trend
+  result.score += 20; // 20 pts for Trend
   result.confluence.push(`${trend.charAt(0).toUpperCase() + trend.slice(1)} Trend`);
 
   const lastIndex = analysis.candlesAnalysed - 1;
 
-  // 1. Market Structure Shift (BOS / CHOCH)
+  // 1. Market Structure Shift (BOS / CHOCH) - 20 pts
   const recentEvent = [...(analysis.structureEvents ?? [])]
     .filter(event =>
       event.direction === trend &&
@@ -172,14 +173,14 @@ export function evaluateSetup(analysis, currentPrice) {
     .sort((a, b) => b.index - a.index)[0];
 
   if (recentEvent) {
-    result.score += 20; // 20 pts for MSS
+    result.score += 20;
     result.evidence.push(`Recent ${recentEvent.type} confirms ${trend} structure.`);
     result.confluence.push(`${recentEvent.type} Confirmed`);
   } else {
     result.reasons.push(`No matching BOS/CHOCH event in the last ${MAX_EVENT_AGE} candles.`);
   }
 
-  // 2. Order Block
+  // 2. Order Block - 20 pts
   const validBlocks = (analysis.orderBlocks ?? [])
     .filter(ob => {
       if (ob.direction !== trend) return false;
@@ -202,11 +203,11 @@ export function evaluateSetup(analysis, currentPrice) {
     return result; // Exit early, no OB means no trade
   }
 
-  result.score += 20; // 20 pts for OB
+  result.score += 20;
   result.evidence.push(`A ${trend} order block is nearby (${block.status}).`);
   result.confluence.push("Order Block");
 
-  // 3. Liquidity Sweep
+  // 3. Liquidity Sweep - 15 pts
   const relevantSweep = [...(analysis.sweeps ?? [])]
     .filter(sweep =>
       sweep.direction === trend &&
@@ -216,14 +217,14 @@ export function evaluateSetup(analysis, currentPrice) {
     .sort((a, b) => b.index - a.index)[0];
 
   if (relevantSweep) {
-    result.score += 15; // 15 pts for sweep
+    result.score += 15;
     result.evidence.push(`Recent ${relevantSweep.side}-side liquidity sweep supports the setup.`);
     result.confluence.push("Liquidity Sweep");
   } else {
     result.reasons.push("No recent matching liquidity sweep.");
   }
 
-  // 4. Fair Value Gap (FVG)
+  // 4. Fair Value Gap (FVG) - 15 pts
   const relevantFvg = (analysis.fvg ?? []).find(fvg => {
     if (fvg.direction !== trend) return false;
     if (!["unmitigated", "partially_mitigated"].includes(fvg.status)) return false;
@@ -234,19 +235,19 @@ export function evaluateSetup(analysis, currentPrice) {
   });
 
   if (relevantFvg) {
-    result.score += 15; // 15 pts for FVG
+    result.score += 15;
     result.evidence.push(`A nearby ${trend} fair value gap provides confluence.`);
     result.confluence.push("Fair Value Gap");
   } else {
     result.reasons.push("No nearby valid matching FVG.");
   }
 
-  // 5. Premium / Discount Zone
+  // 5. Premium / Discount Zone - 10 pts
   const range = analysis.dealingRange;
   if (range?.valid && !range.outside) {
     const locationSupportsDirection = trend === "bullish" ? range.zone === "discount" : range.zone === "premium";
     if (locationSupportsDirection) {
-      result.score += 10; // 10 pts for PD array
+      result.score += 10;
       result.evidence.push(`${range.zone} pricing supports the ${result.direction} idea.`);
       result.confluence.push(`${range.zone.charAt(0).toUpperCase() + range.zone.slice(1)} Zone`);
     } else {
@@ -287,14 +288,14 @@ export function evaluateSetup(analysis, currentPrice) {
     take_profit: [tp1, tp2, tp3] // Array of TPs for the app
   };
 
-  // 🛑 STRICT FILTER: Only send to the app if the score is 80 or above
-  if (result.score >= 80 && recentEvent) {
+  // 🛑 QUALITY FILTER: Only send to the app if the score is 65 or above
+  if (result.score >= 65 && recentEvent) {
     result.decision = trend === "bullish" ? "BUY" : "SELL";
     result.confidence = result.score;
     
     // Assign Grade based on score
-    if (result.score >= 95) result.quality = "A+";
-    else if (result.score >= 85) result.quality = "A";
+    if (result.score >= 90) result.quality = "A+";
+    else if (result.score >= 80) result.quality = "A";
     else result.quality = "B";
 
     result.confidenceLabel = `${result.quality} Setup`;
@@ -302,8 +303,8 @@ export function evaluateSetup(analysis, currentPrice) {
   } else {
     result.decision = "NO_TRADE";
     result.confidenceLabel = "Insufficient confluence";
-    result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 80.`);
+    result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 65.`);
   }
 
   return result;
-  }
+}
