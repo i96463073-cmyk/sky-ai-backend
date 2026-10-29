@@ -30,16 +30,17 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    console.log("Cron Job Started: Scanning pairs...");
+    console.log("Cron Job Started: Managing trades and scanning...");
     
     let pendingTrades = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
+    let completedTrades = JSON.parse(await env.SKY_MEMORY.get("completed_trades") || "[]");
     let livePrices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
     
     const symbolsToScan = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"];
     const timeframes = ["M15", "H1"];
 
+    // 1. FETCH LIVE PRICES
     for (const symbol of symbolsToScan) {
-      // 1. Fetch live prices for Ticker & Pips
       try {
         const marketData = await getMarketData(env, symbol, "M15", 1);
         if (marketData && marketData.ok && marketData.candles && marketData.candles.length > 0) {
@@ -48,14 +49,90 @@ export default {
       } catch (e) {
         console.error(`Error fetching price for ${symbol}:`, e);
       }
+    }
 
-      // 2. Scan for signals
+    // 2. CHECK ACTIVE TRADES FOR SL/TP HITS
+    let activeTrades = [];
+    
+    for (const trade of pendingTrades) {
+      const px = livePrices[trade.symbol];
+      if (!px) {
+        activeTrades.push(trade); 
+        continue; 
+      }
+
+      if (!trade.tp_hit) trade.tp_hit = 0;
+      
+      const sl = trade.stop_loss;
+      const tps = trade.take_profit;
+      const lastTp = tps[tps.length - 1]; // TP3
+      
+      // Update highest TP hit
+      if (trade.direction === "BUY") {
+        if (tps[0] && px >= tps[0]) trade.tp_hit = Math.max(trade.tp_hit, 1);
+        if (tps[1] && px >= tps[1]) trade.tp_hit = Math.max(trade.tp_hit, 2);
+        if (tps[2] && px >= tps[2]) trade.tp_hit = Math.max(trade.tp_hit, 3);
+      } else {
+        if (tps[0] && px <= tps[0]) trade.tp_hit = Math.max(trade.tp_hit, 1);
+        if (tps[1] && px <= tps[1]) trade.tp_hit = Math.max(trade.tp_hit, 2);
+        if (tps[2] && px <= tps[2]) trade.tp_hit = Math.max(trade.tp_hit, 3);
+      }
+
+      let isClosed = false;
+      let result = "PENDING";
+      let exitPrice = px;
+
+      if (trade.direction === "BUY") {
+        if (px >= lastTp) {
+          isClosed = true;
+          result = "WIN";
+          exitPrice = lastTp;
+        } else if (px <= sl) {
+          isClosed = true;
+          if (trade.tp_hit > 0) {
+            result = "WIN"; // Locked in partial profit
+            exitPrice = tps[trade.tp_hit - 1]; // Record the highest TP hit
+          } else {
+            result = "LOSS";
+            exitPrice = sl;
+          }
+        }
+      } else if (trade.direction === "SELL") {
+        if (px <= lastTp) {
+          isClosed = true;
+          result = "WIN";
+          exitPrice = lastTp;
+        } else if (px >= sl) {
+          isClosed = true;
+          if (trade.tp_hit > 0) {
+            result = "WIN"; // Locked in partial profit
+            exitPrice = tps[trade.tp_hit - 1];
+          } else {
+            result = "LOSS";
+            exitPrice = sl;
+          }
+        }
+      }
+
+      if (isClosed) {
+        console.log(`❌ Trade Closed: ${trade.symbol} | Result: ${result} | TP Hit: ${trade.tp_hit}`);
+        trade.result = result;
+        trade.closed_at = new Date().toISOString();
+        trade.exit_price = exitPrice;
+        completedTrades.unshift(trade);
+      } else {
+        activeTrades.push(trade);
+      }
+    }
+
+    // 3. SCAN FOR NEW SIGNALS
+    for (const symbol of symbolsToScan) {
       for (const tf of timeframes) {
         try {
           const res = await getSignal(env, symbol, tf);
           
           if (res.ok && res.signal && (res.signal.decision === "BUY" || res.signal.decision === "SELL")) {
-            const exists = pendingTrades.find(t => t.symbol === symbol && t.timeframe === tf);
+            const exists = activeTrades.find(t => t.symbol === symbol && t.timeframe === tf);
             if (exists) continue;
 
             const levels = res.signal.levels;
@@ -72,13 +149,13 @@ export default {
               quality: res.signal.quality || "C",
               confluence: res.signal.confluence || [],
               created_at: new Date().toISOString(),
-              timeframe: tf
+              timeframe: tf,
+              tp_hit: 0 // Initialize
             };
 
-            pendingTrades.push(newTrade);
-            console.log(`✅ Found: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
+            activeTrades.push(newTrade);
+            console.log(`✅ New Setup: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
 
-            // 3. Send to Telegram ONLY if Confidence >= 70%
             if (newTrade.confidence >= 70) {
               const tgMessage = `
 🚨 <b>SKY AI SIGNAL (${newTrade.confidence}%)</b> 🚨
@@ -89,7 +166,6 @@ export default {
 <b>Entry:</b> ${levels.entry.toFixed(5)}
 <b>Stop Loss:</b> ${levels.stop_loss.toFixed(5)}
 <b>TP1:</b> ${levels.take_profit[0].toFixed(5)}
-<b>TP2:</b> ${levels.take_profit[1].toFixed(5)}
 <b>TP3:</b> ${levels.take_profit[2].toFixed(5)}
               `.trim();
               await sendTelegramMessage(env, tgMessage);
@@ -101,11 +177,10 @@ export default {
       }
     }
 
-    pendingTrades = pendingTrades.slice(-30); 
-    
-    await env.SKY_MEMORY.put("pending_trades", JSON.stringify(pendingTrades));
+    completedTrades = completedTrades.slice(0, 50);
+
+    await env.SKY_MEMORY.put("pending_trades", JSON.stringify(activeTrades));
+    await env.SKY_MEMORY.put("completed_trades", JSON.stringify(completedTrades));
     await env.SKY_MEMORY.put("live_prices", JSON.stringify(livePrices));
-    
-    console.log(`Cron Job Finished. Active: ${pendingTrades.length}, Prices: ${Object.keys(livePrices).length}`);
   }
 };
