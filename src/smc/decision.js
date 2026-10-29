@@ -64,7 +64,6 @@ export function evaluateSetup(analysis, currentPrice) {
 
   const lastIndex = analysis.candlesAnalysed - 1;
 
-  // 1. Market Structure Shift (20 pts)
   const recentEvent = [...(analysis.structureEvents ?? [])]
     .filter(event => event.direction === trend && lastIndex - event.index >= 0 && lastIndex - event.index <= MAX_EVENT_AGE)
     .sort((a, b) => b.index - a.index)[0];
@@ -75,7 +74,6 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confluence.push(`${recentEvent.type} Confirmed`);
   }
 
-  // 2. Order Block (20 pts)
   const validBlocks = (analysis.orderBlocks ?? [])
     .filter(ob => {
       if (ob.direction !== trend) return false;
@@ -97,7 +95,6 @@ export function evaluateSetup(analysis, currentPrice) {
   result.evidence.push(`A ${trend} order block is nearby (${block.status}).`);
   result.confluence.push("Order Block");
 
-  // 3. Liquidity Sweep (15 pts)
   const relevantSweep = [...(analysis.sweeps ?? [])]
     .filter(sweep => sweep.direction === trend && lastIndex - sweep.index >= 0 && lastIndex - sweep.index <= MAX_EVENT_AGE)
     .sort((a, b) => b.index - a.index)[0];
@@ -108,7 +105,6 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confluence.push("Liquidity Sweep");
   }
 
-  // 4. FVG (15 pts)
   const relevantFvg = (analysis.fvg ?? []).find(fvg => {
     if (fvg.direction !== trend) return false;
     if (!["unmitigated", "partially_mitigated"].includes(fvg.status)) return false;
@@ -123,7 +119,6 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confluence.push("Fair Value Gap");
   }
 
-  // 5. Premium / Discount Zone (10 pts)
   const range = analysis.dealingRange;
   if (range?.valid && !range.outside) {
     const locationSupportsDirection = trend === "bullish" ? range.zone === "discount" : range.zone === "premium";
@@ -148,10 +143,10 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.levels = { entry: entry, stop_loss: stopLoss, take_profit: [tp1, tp2, tp3] };
 
-  // 🌟 LOWERED THRESHOLD TO 40 (and removed the strict MSS requirement so it fires more often)
+  // 🌟 Score threshold is 40 for generating a signal
   if (result.score >= 40) {
     result.decision = trend === "bullish" ? "BUY" : "SELL";
-    result.confidence = result.score;
+    result.confidence = result.score; // ✅ Saves the score
     
     if (result.score >= 90) result.quality = "A+";
     else if (result.score >= 80) result.quality = "A";
