@@ -30,9 +30,10 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    console.log("Cron Job Started: Managing trades and scanning...");
+    console.log("Cron Job Started: Managing trades, watchlist, and scanning...");
     
     let pendingTrades = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
+    let watchlist = JSON.parse(await env.SKY_MEMORY.get("watchlist_trades") || "[]");
     let completedTrades = JSON.parse(await env.SKY_MEMORY.get("completed_trades") || "[]");
     let livePrices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
     
@@ -51,9 +52,50 @@ export default {
       }
     }
 
-    // 2. MANAGE ACTIVE TRADES
+    // 2. CHECK WATCHLIST FOR ENTRY TRIGGERS
+    let newWatchlist = [];
+    for (const trade of watchlist) {
+      const px = livePrices[trade.symbol];
+      if (!px) { newWatchlist.push(trade); continue; }
+
+      let isTriggered = false;
+      let isInvalidated = false;
+
+      if (trade.direction === "BUY") {
+        if (px <= trade.entry) isTriggered = true; // Price dropped to entry
+        else if (px <= trade.stop_loss) isInvalidated = true; // Price hit SL before entry
+      } else {
+        if (px >= trade.entry) isTriggered = true; // Price rose to entry
+        else if (px >= trade.stop_loss) isInvalidated = true; // Price hit SL before entry
+      }
+
+      if (isTriggered) {
+        console.log(`🎯 Watchlist Triggered: ${trade.symbol} ${trade.timeframe}`);
+        pendingTrades.push(trade); // Move to active app trades
+        
+        // Send Telegram Alert NOW that entry is hit
+        if (trade.confidence >= 60) {
+          let emoji = trade.quality === "HIGH" ? "🔥" : "⚡";
+          await sendTelegramMessage(env, `
+${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> ${emoji}
+<b>Pair:</b> ${trade.symbol} (${trade.timeframe})
+<b>Direction:</b> ${trade.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
+-----------------------------------
+<b>Entry:</b> ${trade.entry.toFixed(5)}
+<b>Stop Loss:</b> ${trade.stop_loss.toFixed(5)}
+<b>TP1:</b> ${trade.take_profit[0].toFixed(5)}
+          `.trim());
+        }
+      } else if (!isInvalidated) {
+        newWatchlist.push(trade); // Keep waiting
+      } else {
+        console.log(`🗑️ Watchlist Invalidated (Hit SL before Entry): ${trade.symbol} ${trade.timeframe}`);
+      }
+    }
+    watchlist = newWatchlist;
+
+    // 3. MANAGE ACTIVE TRADES (TP/SL)
     let activeTrades = [];
-    
     for (const trade of pendingTrades) {
       const px = livePrices[trade.symbol];
       if (!px) { activeTrades.push(trade); continue; }
@@ -64,7 +106,6 @@ export default {
       const tps = trade.take_profit;
       const lastTp = tps[tps.length - 1]; 
       
-      // Update highest TP hit
       if (trade.direction === "BUY") {
         if (tps[0] && px >= tps[0]) trade.tp_hit = Math.max(trade.tp_hit, 1);
         if (tps[1] && px >= tps[1]) trade.tp_hit = Math.max(trade.tp_hit, 2);
@@ -105,7 +146,7 @@ export default {
       }
     }
 
-    // 3. SCAN FOR NEW SIGNALS
+    // 4. SCAN FOR NEW SIGNALS
     for (const symbol of symbolsToScan) {
       for (const tf of timeframes) {
         try {
@@ -113,19 +154,16 @@ export default {
           
           if (res.ok && res.signal && (res.signal.decision === "BUY" || res.signal.decision === "SELL")) {
             
-            const existingForPair = activeTrades.filter(t => t.symbol === symbol);
+            const existingActive = activeTrades.filter(t => t.symbol === symbol);
+            const existingWatch = watchlist.filter(t => t.symbol === symbol);
             
-            // 🚫 RULE 1: Skip if exact same timeframe is already active
-            if (existingForPair.some(t => t.timeframe === tf)) continue;
+            // Skip exact match
+            if (existingActive.some(t => t.timeframe === tf) || existingWatch.some(t => t.timeframe === tf)) continue;
 
-            // 🚫 RULE 2: If pair is active on a different TF, only allow if HIGH QUALITY (>= 80)
-            if (existingForPair.length > 0 && res.signal.confidence < 80) {
-              console.log(`⏩ Skipped ${symbol} ${tf}: Active on another TF and score is not High (${res.signal.confidence})`);
-              continue;
-            }
+            // Skip if active on other TF and not high quality
+            if ((existingActive.length > 0 || existingWatch.length > 0) && res.signal.confidence < 80) continue;
 
             const levels = res.signal.levels;
-            const isBuy = res.signal.decision === "BUY";
 
             const newTrade = {
               id: "sig_" + Date.now() + "_" + Math.floor(Math.random()*1000),
@@ -142,25 +180,10 @@ export default {
               tp_hit: 0
             };
 
-            activeTrades.push(newTrade);
-            console.log(`✅ New Setup: ${symbol} ${tf} | Score: ${newTrade.confidence}% | ${newTrade.quality}`);
-
-            // 📨 SEND TO TELEGRAM ONLY IF GOOD (60+) OR HIGH (80+)
-            if (newTrade.confidence >= 60) {
-              let emoji = newTrade.quality === "HIGH" ? "🔥" : "⚡";
-              let tgMessage = `
-${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${emoji}
-<b>Pair:</b> ${symbol} (${tf})
-<b>Direction:</b> ${isBuy ? "🟢 BUY" : "🔴 SELL"}
------------------------------------
-<b>Entry:</b> ${levels.entry.toFixed(5)}
-<b>Stop Loss:</b> ${levels.stop_loss.toFixed(5)}
-<b>TP1:</b> ${levels.take_profit[0].toFixed(5)}
-<b>TP2:</b> ${levels.take_profit[1].toFixed(5)}
-<b>TP3:</b> ${levels.take_profit[2].toFixed(5)}
-              `.trim();
-              await sendTelegramMessage(env, tgMessage);
-            }
+            // Add to Watchlist (Do NOT send to app yet)
+            watchlist.push(newTrade);
+            console.log(`👀 Added to Watchlist: ${symbol} ${tf} | Waiting for entry at ${levels.entry}`);
+            
           }
         } catch (e) {
           console.error(`Error scanning ${symbol} ${tf}:`, e);
@@ -168,10 +191,15 @@ ${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${em
       }
     }
 
+    // Keep DB clean
     completedTrades = completedTrades.slice(0, 50);
+    watchlist = watchlist.slice(-20);
 
     await env.SKY_MEMORY.put("pending_trades", JSON.stringify(activeTrades));
+    await env.SKY_MEMORY.put("watchlist_trades", JSON.stringify(watchlist));
     await env.SKY_MEMORY.put("completed_trades", JSON.stringify(completedTrades));
     await env.SKY_MEMORY.put("live_prices", JSON.stringify(livePrices));
+    
+    console.log(`Job Done. Active: ${activeTrades.length}, Watchlist: ${watchlist.length}`);
   }
 };
