@@ -51,21 +51,18 @@ export default {
       }
     }
 
-    // 2. CHECK ACTIVE TRADES FOR SL/TP HITS
+    // 2. MANAGE ACTIVE TRADES
     let activeTrades = [];
     
     for (const trade of pendingTrades) {
       const px = livePrices[trade.symbol];
-      if (!px) {
-        activeTrades.push(trade); 
-        continue; 
-      }
+      if (!px) { activeTrades.push(trade); continue; }
 
       if (!trade.tp_hit) trade.tp_hit = 0;
       
       const sl = trade.stop_loss;
       const tps = trade.take_profit;
-      const lastTp = tps[tps.length - 1]; // TP3
+      const lastTp = tps[tps.length - 1]; 
       
       // Update highest TP hit
       if (trade.direction === "BUY") {
@@ -83,39 +80,22 @@ export default {
       let exitPrice = px;
 
       if (trade.direction === "BUY") {
-        if (px >= lastTp) {
+        if (px >= lastTp) { isClosed = true; result = "WIN"; exitPrice = lastTp; }
+        else if (px <= sl) {
           isClosed = true;
-          result = "WIN";
-          exitPrice = lastTp;
-        } else if (px <= sl) {
-          isClosed = true;
-          if (trade.tp_hit > 0) {
-            result = "WIN"; // Locked in partial profit
-            exitPrice = tps[trade.tp_hit - 1]; // Record the highest TP hit
-          } else {
-            result = "LOSS";
-            exitPrice = sl;
-          }
+          if (trade.tp_hit > 0) { result = "WIN"; exitPrice = tps[trade.tp_hit - 1]; }
+          else { result = "LOSS"; exitPrice = sl; }
         }
       } else if (trade.direction === "SELL") {
-        if (px <= lastTp) {
+        if (px <= lastTp) { isClosed = true; result = "WIN"; exitPrice = lastTp; }
+        else if (px >= sl) {
           isClosed = true;
-          result = "WIN";
-          exitPrice = lastTp;
-        } else if (px >= sl) {
-          isClosed = true;
-          if (trade.tp_hit > 0) {
-            result = "WIN"; // Locked in partial profit
-            exitPrice = tps[trade.tp_hit - 1];
-          } else {
-            result = "LOSS";
-            exitPrice = sl;
-          }
+          if (trade.tp_hit > 0) { result = "WIN"; exitPrice = tps[trade.tp_hit - 1]; }
+          else { result = "LOSS"; exitPrice = sl; }
         }
       }
 
       if (isClosed) {
-        console.log(`❌ Trade Closed: ${trade.symbol} | Result: ${result} | TP Hit: ${trade.tp_hit}`);
         trade.result = result;
         trade.closed_at = new Date().toISOString();
         trade.exit_price = exitPrice;
@@ -132,8 +112,17 @@ export default {
           const res = await getSignal(env, symbol, tf);
           
           if (res.ok && res.signal && (res.signal.decision === "BUY" || res.signal.decision === "SELL")) {
-            const exists = activeTrades.find(t => t.symbol === symbol && t.timeframe === tf);
-            if (exists) continue;
+            
+            const existingForPair = activeTrades.filter(t => t.symbol === symbol);
+            
+            // 🚫 RULE 1: Skip if exact same timeframe is already active
+            if (existingForPair.some(t => t.timeframe === tf)) continue;
+
+            // 🚫 RULE 2: If pair is active on a different TF, only allow if HIGH QUALITY (>= 80)
+            if (existingForPair.length > 0 && res.signal.confidence < 80) {
+              console.log(`⏩ Skipped ${symbol} ${tf}: Active on another TF and score is not High (${res.signal.confidence})`);
+              continue;
+            }
 
             const levels = res.signal.levels;
             const isBuy = res.signal.decision === "BUY";
@@ -145,27 +134,29 @@ export default {
               entry: levels.entry,
               stop_loss: levels.stop_loss,
               take_profit: levels.take_profit, 
-              confidence: res.signal.confidence || 0, 
-              quality: res.signal.quality || "C",
+              confidence: res.signal.confidence, 
+              quality: res.signal.quality,
               confluence: res.signal.confluence || [],
               created_at: new Date().toISOString(),
               timeframe: tf,
-              tp_hit: 0 // Initialize
+              tp_hit: 0
             };
 
             activeTrades.push(newTrade);
-            console.log(`✅ New Setup: ${symbol} ${tf} | Score: ${newTrade.confidence}%`);
+            console.log(`✅ New Setup: ${symbol} ${tf} | Score: ${newTrade.confidence}% | ${newTrade.quality}`);
 
-            if (newTrade.confidence >= 70) {
-              const tgMessage = `
-🚨 <b>SKY AI SIGNAL (${newTrade.confidence}%)</b> 🚨
+            // 📨 SEND TO TELEGRAM ONLY IF GOOD (60+) OR HIGH (80+)
+            if (newTrade.confidence >= 60) {
+              let emoji = newTrade.quality === "HIGH" ? "🔥" : "⚡";
+              let tgMessage = `
+${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${emoji}
 <b>Pair:</b> ${symbol} (${tf})
 <b>Direction:</b> ${isBuy ? "🟢 BUY" : "🔴 SELL"}
-<b>Quality:</b> ${newTrade.quality}
 -----------------------------------
 <b>Entry:</b> ${levels.entry.toFixed(5)}
 <b>Stop Loss:</b> ${levels.stop_loss.toFixed(5)}
 <b>TP1:</b> ${levels.take_profit[0].toFixed(5)}
+<b>TP2:</b> ${levels.take_profit[1].toFixed(5)}
 <b>TP3:</b> ${levels.take_profit[2].toFixed(5)}
               `.trim();
               await sendTelegramMessage(env, tgMessage);
