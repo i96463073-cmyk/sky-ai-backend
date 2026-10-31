@@ -143,18 +143,22 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.levels = { entry: entry, stop_loss: stopLoss, take_profit: [tp1, tp2, tp3] };
 
-  // 🌟 Score threshold is 40 for generating a signal
-  if (result.score >= 40) {
+  // 🌟 CATEGORIZATION
+  if (result.score >= 80) {
     result.decision = trend === "bullish" ? "BUY" : "SELL";
-    result.confidence = result.score; // ✅ Saves the score
-    
-    if (result.score >= 90) result.quality = "A+";
-    else if (result.score >= 80) result.quality = "A";
-    else if (result.score >= 65) result.quality = "B";
-    else result.quality = "C";
-
-    result.confidenceLabel = `${result.quality} Setup`;
-    result.reasons = ["Setup passed minimum confluence threshold."];
+    result.confidence = result.score;
+    result.quality = "HIGH";
+    result.confidenceLabel = "High Quality Setup";
+  } else if (result.score >= 60) {
+    result.decision = trend === "bullish" ? "BUY" : "SELL";
+    result.confidence = result.score;
+    result.quality = "GOOD";
+    result.confidenceLabel = "Good Setup";
+  } else if (result.score >= 40) {
+    result.decision = trend === "bullish" ? "BUY" : "SELL";
+    result.confidence = result.score;
+    result.quality = "STANDARD";
+    result.confidenceLabel = "Standard Setup";
   } else {
     result.decision = "NO_TRADE";
     result.confidenceLabel = "Insufficient confluence";
@@ -162,4 +166,4 @@ export function evaluateSetup(analysis, currentPrice) {
   }
 
   return result;
-}
+  }
