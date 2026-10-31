@@ -143,7 +143,6 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.levels = { entry: entry, stop_loss: stopLoss, take_profit: [tp1, tp2, tp3] };
 
-  // 🌟 CATEGORIZATION
   if (result.score >= 80) {
     result.decision = trend === "bullish" ? "BUY" : "SELL";
     result.confidence = result.score;
@@ -166,4 +165,4 @@ export function evaluateSetup(analysis, currentPrice) {
   }
 
   return result;
-  }
+                                                                                                     }
