@@ -32,15 +32,20 @@ export default {
   async scheduled(event, env, ctx) {
     console.log("Cron Job Started: Managing trades, watchlist, and scanning...");
     
-    let pendingTrades = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
+    // 1. Fetch single DB state (Only 1 read!)
+    const oldAppStateStr = await env.SKY_MEMORY.get("app_state") || '{"pending":[],"completed":[],"news":[]}';
+    const oldAppState = JSON.parse(oldAppStateStr);
+    
+    let pendingTrades = oldAppState.pending || [];
+    let completedTrades = oldAppState.completed || [];
+    let news = oldAppState.news || [];
     let watchlist = JSON.parse(await env.SKY_MEMORY.get("watchlist_trades") || "[]");
-    let completedTrades = JSON.parse(await env.SKY_MEMORY.get("completed_trades") || "[]");
-    let livePrices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
+    let livePrices = {};
     
     const symbolsToScan = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"];
     const timeframes = ["M15", "H1"];
 
-    // 1. FETCH LIVE PRICES
+    // 2. FETCH LIVE PRICES
     for (const symbol of symbolsToScan) {
       try {
         const marketData = await getMarketData(env, symbol, "M15", 1);
@@ -52,7 +57,15 @@ export default {
       }
     }
 
-    // 2. CHECK WATCHLIST FOR ENTRY TRIGGERS
+    // 🟢 WRITE LIVE PRICES TO CACHE (Saves KV Writes & Reads)
+    const cache = caches.default;
+    const cacheKey = new Request("https://sky-ai-backend.i96463073.workers.dev/api/prices-cache", { method: "GET" });
+    const cacheResponse = new Response(JSON.stringify(livePrices), {
+      headers: { "Content-Type": "application/json", "Cache-Control": "s-maxage=300" }
+    });
+    ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+
+    // 3. CHECK WATCHLIST FOR ENTRY TRIGGERS
     let newWatchlist = [];
     for (const trade of watchlist) {
       const px = livePrices[trade.symbol];
@@ -62,18 +75,17 @@ export default {
       let isInvalidated = false;
 
       if (trade.direction === "BUY") {
-        if (px <= trade.entry) isTriggered = true; // Price dropped to entry
-        else if (px <= trade.stop_loss) isInvalidated = true; // Price hit SL before entry
+        if (px <= trade.entry) isTriggered = true;
+        else if (px <= trade.stop_loss) isInvalidated = true;
       } else {
-        if (px >= trade.entry) isTriggered = true; // Price rose to entry
-        else if (px >= trade.stop_loss) isInvalidated = true; // Price hit SL before entry
+        if (px >= trade.entry) isTriggered = true;
+        else if (px >= trade.stop_loss) isInvalidated = true;
       }
 
       if (isTriggered) {
         console.log(`🎯 Watchlist Triggered: ${trade.symbol} ${trade.timeframe}`);
-        pendingTrades.push(trade); // Move to active app trades
+        pendingTrades.push(trade); 
         
-        // Send Telegram Alert NOW that entry is hit
         if (trade.confidence >= 60) {
           let emoji = trade.quality === "HIGH" ? "🔥" : "⚡";
           await sendTelegramMessage(env, `
@@ -87,21 +99,18 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
           `.trim());
         }
       } else if (!isInvalidated) {
-        newWatchlist.push(trade); // Keep waiting
-      } else {
-        console.log(`🗑️ Watchlist Invalidated (Hit SL before Entry): ${trade.symbol} ${trade.timeframe}`);
+        newWatchlist.push(trade);
       }
     }
     watchlist = newWatchlist;
 
-    // 3. MANAGE ACTIVE TRADES (TP/SL)
+    // 4. MANAGE ACTIVE TRADES (TP/SL)
     let activeTrades = [];
     for (const trade of pendingTrades) {
       const px = livePrices[trade.symbol];
       if (!px) { activeTrades.push(trade); continue; }
 
       if (!trade.tp_hit) trade.tp_hit = 0;
-      
       const sl = trade.stop_loss;
       const tps = trade.take_profit;
       const lastTp = tps[tps.length - 1]; 
@@ -146,7 +155,7 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
       }
     }
 
-    // 4. SCAN FOR NEW SIGNALS
+    // 5. SCAN FOR NEW SIGNALS
     for (const symbol of symbolsToScan) {
       for (const tf of timeframes) {
         try {
@@ -157,10 +166,7 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
             const existingActive = activeTrades.filter(t => t.symbol === symbol);
             const existingWatch = watchlist.filter(t => t.symbol === symbol);
             
-            // Skip exact match
             if (existingActive.some(t => t.timeframe === tf) || existingWatch.some(t => t.timeframe === tf)) continue;
-
-            // Skip if active on other TF and not high quality
             if ((existingActive.length > 0 || existingWatch.length > 0) && res.signal.confidence < 80) continue;
 
             const levels = res.signal.levels;
@@ -174,16 +180,15 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
               take_profit: levels.take_profit, 
               confidence: res.signal.confidence, 
               quality: res.signal.quality,
+              breakdown: res.signal.breakdown,
               confluence: res.signal.confluence || [],
               created_at: new Date().toISOString(),
               timeframe: tf,
               tp_hit: 0
             };
 
-            // Add to Watchlist (Do NOT send to app yet)
             watchlist.push(newTrade);
             console.log(`👀 Added to Watchlist: ${symbol} ${tf} | Waiting for entry at ${levels.entry}`);
-            
           }
         } catch (e) {
           console.error(`Error scanning ${symbol} ${tf}:`, e);
@@ -191,15 +196,22 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
       }
     }
 
-    // Keep DB clean
     completedTrades = completedTrades.slice(0, 50);
     watchlist = watchlist.slice(-20);
 
-    await env.SKY_MEMORY.put("pending_trades", JSON.stringify(activeTrades));
-    await env.SKY_MEMORY.put("watchlist_trades", JSON.stringify(watchlist));
-    await env.SKY_MEMORY.put("completed_trades", JSON.stringify(completedTrades));
-    await env.SKY_MEMORY.put("live_prices", JSON.stringify(livePrices));
-    
-    console.log(`Job Done. Active: ${activeTrades.length}, Watchlist: ${watchlist.length}`);
+    // 🟢 6. DIRTY CHECK: ONLY WRITE IF DATA CHANGED
+    const newAppState = { pending: activeTrades, completed: completedTrades, news: news };
+    const newAppStateStr = JSON.stringify(newAppState);
+
+    if (newAppStateStr !== oldAppStateStr) {
+      await env.SKY_MEMORY.put("app_state", newAppStateStr);
+      console.log("Database updated (app_state written).");
+    }
+
+    const oldWatchlistStr = JSON.stringify(watchlist);
+    const newWatchlistStr = JSON.stringify(watchlist);
+    if (newWatchlistStr !== oldWatchlistStr) {
+      await env.SKY_MEMORY.put("watchlist_trades", newWatchlistStr);
+    }
   }
 };
