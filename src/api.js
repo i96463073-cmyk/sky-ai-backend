@@ -3,7 +3,7 @@ import { getMarketData, assessFreshness, providerState } from "./market/biquote.
 import { analyze } from "./smc/analyze.js";
 import { ENGINE_VERSION } from "./smc/config.js";
 
-export const API_VERSION = "signals-api-0.2.1";
+export const API_VERSION = "signals-api-0.2.3";
 
 const HEADERS = {
   "Content-Type": "application/json; charset=UTF-8",
@@ -23,9 +23,15 @@ export async function handleApi(request, env = {}) {
   if (url.pathname === "/api/signals" || url.pathname === "/api/live") {
     if (!env.SKY_MEMORY) return fail(500, "NO_DB", "Database not configured");
     
-    const pendingRaw = JSON.parse(await env.SKY_MEMORY.get("pending_trades") || "[]");
-    const completed = JSON.parse(await env.SKY_MEMORY.get("completed_trades") || "[]");
+    // 🟢 1 READ: Fetch everything from one single key
+    const appStateStr = await env.SKY_MEMORY.get("app_state") || '{"pending":[],"completed":[],"news":[]}';
+    const appState = JSON.parse(appStateStr);
     
+    const pendingRaw = appState.pending || [];
+    const completed = appState.completed || [];
+    const news = appState.news || [];
+    
+    // 2. Filter out trades older than 12 hours
     const now = Date.now();
     const pending = pendingRaw.filter(sig => {
       const timeStr = sig.created_at || sig.time;
@@ -34,12 +40,23 @@ export async function handleApi(request, env = {}) {
       return ageMs < (12 * 60 * 60 * 1000); 
     });
     
+    // 3. Sort newest first
     pending.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
     completed.sort((a, b) => (b.closed_at || "").localeCompare(a.closed_at || ""));
 
-    const live_prices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
-    const news = JSON.parse(await env.SKY_MEMORY.get("news") || "[]");
+    // 🟢 0 READS: Fetch live prices from Cache
+    let live_prices = {};
+    const cache = caches.default;
+    const cacheKey = new Request("https://sky-ai-backend.i96463073.workers.dev/api/prices-cache", { method: "GET" });
+    
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      live_prices = await cachedResponse.json();
+    } else {
+      live_prices = JSON.parse(await env.SKY_MEMORY.get("live_prices") || "{}");
+    }
 
+    // 4. Return the exact format the app expects
     return reply({ ok: true, live_prices, pending, completed, news });
   }
 
