@@ -1,3 +1,52 @@
+const MAX_ZONE_DISTANCE_ATR = 2.5; 
+const MAX_EVENT_AGE = 40;          
+
+function finite(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function addAnnotation(out, type, item, extra = {}) {
+  if (!item) return;
+  out.push({
+    id: `${type}-${item.index ?? item.candleIndex ?? item.confirmIndex ?? item.time ?? out.length}`,
+    type, time: item.time ?? null, index: item.index ?? item.candleIndex ?? item.confirmIndex ?? null,
+    price: finite(item.price ?? item.level), top: finite(item.top ?? item.high), bottom: finite(item.bottom ?? item.low),
+    direction: item.direction ?? null, label: type.replaceAll("_", " "), reason: item.why ?? "", ...extra
+  });
+}
+
+export function buildChartAnnotations(analysis, decision = null) {
+  const annotations = [];
+  for (const swing of analysis.swings ?? []) addAnnotation(annotations, "SWING", swing, { label: swing.label ? `${swing.label} ${swing.type}` : `Swing ${swing.type}` });
+  for (const event of analysis.structureEvents ?? []) addAnnotation(annotations, event.type, event, { label: `${event.type} ${event.direction}`, startTime: event.swingTime, startIndex: event.swingIndex });
+  for (const pool of analysis.liquidityPools ?? []) addAnnotation(annotations, "LIQUIDITY", pool, { label: `${pool.kind} ${pool.side}-side liquidity`, formedIndex: pool.formedIndex, status: pool.status });
+  for (const sweep of analysis.sweeps ?? []) addAnnotation(annotations, "LIQUIDITY_SWEEP", sweep, { label: `${sweep.side}-side liquidity swept` });
+  for (const ob of analysis.orderBlocks ?? []) addAnnotation(annotations, "ORDER_BLOCK", ob, { label: `${ob.direction} order block`, startTime: ob.time, startIndex: ob.candleIndex, endIndex: ob.mitigatedIndex, status: ob.status });
+  for (const fvg of analysis.fvg ?? []) addAnnotation(annotations, "FVG", fvg, { label: `${fvg.direction} fair value gap`, startTime: fvg.time, startIndex: fvg.index, endIndex: fvg.mitigatedIndex, status: fvg.status });
+
+  const range = analysis.dealingRange;
+  if (range?.valid) {
+    annotations.push({ id: "DEALING_RANGE", type: "DEALING_RANGE", top: range.high, bottom: range.low, label: "Dealing range", reason: range.why });
+    annotations.push({ id: "EQUILIBRIUM", type: "EQUILIBRIUM", price: finite(range.equilibrium), label: "50% equilibrium", reason: "Midpoint of the selected dealing range." });
+  }
+
+  if (decision?.levels) {
+    for (const [key, value] of Object.entries(decision.levels)) {
+      if (Array.isArray(value)) {
+        value.forEach((v, i) => {
+          if (finite(v) === null) return;
+          annotations.push({ id: `${key.toUpperCase()}_${i + 1}`, type: key.toUpperCase(), price: Number(v), label: `${key.replaceAll("_", " ").toUpperCase()} ${i + 1}`, direction: decision.direction ?? null });
+        });
+      } else {
+        if (finite(value) === null) continue;
+        annotations.push({ id: key.toUpperCase(), type: key.toUpperCase(), price: Number(value), label: key.replaceAll("_", " ").toUpperCase(), direction: decision.direction ?? null });
+      }
+    }
+  }
+  return annotations;
+}
+
 export function evaluateSetup(analysis, currentPrice) {
   const price = finite(currentPrice);
   const atr = finite(analysis.atr?.value);
@@ -114,7 +163,6 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confluence.push(isLondon ? "London Session" : "NY Session");
   }
 
-
   // ==========================================
   // SMART STOP LOSS & RISK:REWARD
   // ==========================================
@@ -153,7 +201,6 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.levels = { entry: entry, stop_loss: stopLoss, take_profit: [tp1, tp2, tp3] };
 
-
   // ==========================================
   // STRICTER SCORING
   // ==========================================
@@ -164,17 +211,16 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confidence = result.score;
     result.quality = "HIGH";
     result.confidenceLabel = "High Quality Setup";
-  } else if (result.score >= 65) { // Minimum score raised to 65
+  } else if (result.score >= 65) { 
     result.decision = result.direction;
     result.confidence = result.score;
     result.quality = "GOOD";
     result.confidenceLabel = "Good Setup";
   } else {
-    // Removed the 50-point standard tier. If it's not a Good or High setup, it's a NO_TRADE.
     result.decision = "NO_TRADE";
     result.confidenceLabel = "Insufficient confluence";
     result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 65.`);
   }
 
   return result;
-}
+            }
