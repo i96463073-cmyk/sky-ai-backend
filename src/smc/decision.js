@@ -146,25 +146,22 @@ export function evaluateSetup(analysis, currentPrice) {
   const now = new Date();
   const eatHour = (now.getUTCHours() + 3) % 24;
   
-  // Define killzones based on EAT
-  const isAsian = eatHour >= 2 && eatHour < 10;   // 02:00 - 10:00 EAT (Tokyo/Sydney overlap)
+  const isAsian = eatHour >= 2 && eatHour < 10;   // 02:00 - 10:00 EAT
   const isLondon = eatHour >= 10 && eatHour < 15; // 10:00 - 15:00 EAT
   const isNewYork = eatHour >= 16 && eatHour < 20; // 16:00 - 20:00 EAT
 
-  // REJECT: Block all trades during Asian session to avoid low-volume chop
   if (isAsian) {
     result.reasons.push("Signal rejected: Asian Session (Low liquidity/chop).");
     return result; 
   }
 
-  // AWARD POINTS: If it's London or NY, give the bonus points
   if (isLondon || isNewYork) {
     scores.session = 10;
     result.confluence.push(isLondon ? "London Session" : "NY Session");
   }
 
   // ==========================================
-  // SMART STOP LOSS & RISK:REWARD
+  // STRUCTURAL STOP LOSS (Like the Image)
   // ==========================================
   result.candidateZone = block ? { top: Number(block.top), bottom: Number(block.bottom), orderBlockTime: block.time, status: block.status } : null;
   
@@ -172,11 +169,11 @@ export function evaluateSetup(analysis, currentPrice) {
   let stopLoss = 0;
 
   if (block) {
-    // Place SL behind the Order Block + 20% ATR buffer
+    // Place SL behind the Order Block (Support/Resistance) + 20% ATR buffer
     const buffer = atr * 0.2; 
     let structuralSL = trend === "bullish" ? Number(block.bottom) - buffer : Number(block.top) + buffer;
     
-    // Ensure minimum distance of 1.5 * ATR to survive market noise
+    // Ensure the SL is not too tight (at least 1.5 ATR away to survive wicks)
     const minDistance = atr * 1.5;
     const currentDistance = Math.abs(entry - structuralSL);
     
@@ -186,7 +183,7 @@ export function evaluateSetup(analysis, currentPrice) {
       stopLoss = structuralSL;
     }
   } else {
-    // No block? Use a wider safety net (2x ATR) to survive noise
+    // No Order Block? Use a 2x ATR structural safety net
     const buffer = atr * 2.0; 
     stopLoss = trend === "bullish" ? entry - buffer : entry + buffer;
   }
@@ -194,9 +191,12 @@ export function evaluateSetup(analysis, currentPrice) {
   const risk = Math.abs(entry - stopLoss);
   if (!(risk > 0) || !Number.isFinite(risk)) { result.reasons.push("Invalid stop-loss."); return result; }
 
-  // Changed Risk:Reward to 1.5R, 2.5R, 4.0R globally
-  const tp1 = trend === "bullish" ? entry + (1.5 * risk) : entry - (1.5 * risk);
-  const tp2 = trend === "bullish" ? entry + (2.5 * risk) : entry - (2.5 * risk);
+  // ==========================================
+  // THE 1:3 RISK/REWARD LOGIC (From your image)
+  // ==========================================
+  // TP1 is 1:2 (Secure partials), TP2 is the main 1:3 target, TP3 is a 1:4 runner.
+  const tp1 = trend === "bullish" ? entry + (2.0 * risk) : entry - (2.0 * risk);
+  const tp2 = trend === "bullish" ? entry + (3.0 * risk) : entry - (3.0 * risk);
   const tp3 = trend === "bullish" ? entry + (4.0 * risk) : entry - (4.0 * risk);
 
   result.levels = { entry: entry, stop_loss: stopLoss, take_profit: [tp1, tp2, tp3] };
@@ -223,4 +223,4 @@ export function evaluateSetup(analysis, currentPrice) {
   }
 
   return result;
-            }
+                  }
