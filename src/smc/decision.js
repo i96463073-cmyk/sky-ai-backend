@@ -1,4 +1,4 @@
-const MAX_ZONE_DISTANCE_ATR = 2.5; 
+const MAX_ZONE_DISTANCE_ATR = 3.0; // Widened from 2.5 to catch more setups
 const MAX_EVENT_AGE = 40;          
 
 function finite(value) {
@@ -52,13 +52,12 @@ export function evaluateSetup(analysis, currentPrice) {
   const atr = finite(analysis.atr?.value);
   const trend = String(analysis.trend ?? "").toLowerCase();
 
-  // Breakdown Scores (Total 100)
   const scores = {
-    htf: 0,       // Max 20
-    liquidity: 0, // Max 20
-    structure: 0, // Max 20
-    fvg_ob: 0,    // Max 20
-    session: 0    // Max 20
+    htf: 0,       
+    liquidity: 0, 
+    structure: 0, 
+    fvg_ob: 0,    
+    session: 0    
   };
 
   const result = { decision: "NO_TRADE", direction: null, score: 0, maxScore: 100, confidence: 0, quality: null, breakdown: scores, confidenceLabel: "Insufficient evidence", reasons: [], confluence: [], evidence: [], candidateZone: null, levels: null, entryStatus: "NOT_CONFIRMED" };
@@ -68,7 +67,7 @@ export function evaluateSetup(analysis, currentPrice) {
 
   result.direction = trend === "bullish" ? "BUY" : "SELL";
 
-  // 1. HTF Alignment (Using trend as proxy)
+  // 1. HTF Alignment
   scores.htf = 20;
   result.confluence.push(`${trend.charAt(0).toUpperCase() + trend.slice(1)} Trend`);
 
@@ -80,11 +79,11 @@ export function evaluateSetup(analysis, currentPrice) {
     .sort((a, b) => b.index - a.index)[0];
 
   if (recentEvent) {
-    scores.structure = 18;
+    scores.structure = 20;
     result.confluence.push(`${recentEvent.type} Confirmed`);
   }
 
-  // 3. Order Block & FVG (FVG/OB confirmation)
+  // 3. Order Block & FVG
   const validBlocks = (analysis.orderBlocks ?? [])
     .filter(ob => {
       if (ob.direction !== trend) return false;
@@ -115,7 +114,7 @@ export function evaluateSetup(analysis, currentPrice) {
   });
 
   if (relevantFvg) {
-    fvgScore = 8;
+    fvgScore = 10;
     result.confluence.push("Fair Value Gap");
   }
   scores.fvg_ob = obScore + fvgScore;
@@ -126,23 +125,22 @@ export function evaluateSetup(analysis, currentPrice) {
     .sort((a, b) => b.index - a.index)[0];
 
   if (relevantSweep) {
-    scores.liquidity = 18;
+    scores.liquidity = 20;
     result.confluence.push("Liquidity Sweep");
   }
 
-  // 5. Session & News (Killzones in Kenyan Time EAT UTC+3)
-  // London: 11:00 - 15:00 EAT
-  // New York: 16:00 - 20:00 EAT
+  // 5. Session (Killzones in Kenyan Time EAT UTC+3)
   const now = new Date();
   const eatHour = (now.getUTCHours() + 3) % 24;
   const isLondon = eatHour >= 11 && eatHour < 15;
   const isNewYork = eatHour >= 16 && eatHour < 20;
   
   if (isLondon || isNewYork) {
-    scores.session = 14;
+    scores.session = 20;
     result.confluence.push(isLondon ? "London Killzone" : "NY Killzone");
   } else {
-    result.reasons.push("Outside Killzones (Low volume session)");
+    // 🟢 REMOVED THE BLOCK: It just gets 0 points, but can still pass!
+    scores.session = 0; 
   }
 
   // Build the levels
@@ -163,6 +161,7 @@ export function evaluateSetup(analysis, currentPrice) {
   // Calculate total score
   result.score = scores.htf + scores.liquidity + scores.structure + scores.fvg_ob + scores.session;
 
+  // 🟢 LOWERED THRESHOLD TO 30 so you get way more signals
   if (result.score >= 80) {
     result.decision = result.direction;
     result.confidence = result.score;
@@ -173,7 +172,7 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confidence = result.score;
     result.quality = "GOOD";
     result.confidenceLabel = "Good Setup";
-  } else if (result.score >= 40) {
+  } else if (result.score >= 30) {
     result.decision = result.direction;
     result.confidence = result.score;
     result.quality = "STANDARD";
@@ -185,4 +184,4 @@ export function evaluateSetup(analysis, currentPrice) {
   }
 
   return result;
-                            }
+            }
