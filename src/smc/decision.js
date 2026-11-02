@@ -1,4 +1,4 @@
-const MAX_ZONE_DISTANCE_ATR = 3.0; 
+const MAX_ZONE_DISTANCE_ATR = 2.5; 
 const MAX_EVENT_AGE = 40;          
 
 function finite(value) {
@@ -22,13 +22,7 @@ export function buildChartAnnotations(analysis, decision = null) {
   for (const event of analysis.structureEvents ?? []) addAnnotation(annotations, event.type, event, { label: `${event.type} ${event.direction}`, startTime: event.swingTime, startIndex: event.swingIndex });
   for (const pool of analysis.liquidityPools ?? []) addAnnotation(annotations, "LIQUIDITY", pool, { label: `${pool.kind} ${pool.side}-side liquidity`, formedIndex: pool.formedIndex, status: pool.status });
   for (const sweep of analysis.sweeps ?? []) addAnnotation(annotations, "LIQUIDITY_SWEEP", sweep, { label: `${sweep.side}-side liquidity swept` });
-  
-  // Label the Order Blocks as Supply/Demand
-  for (const ob of analysis.orderBlocks ?? []) {
-    const label = ob.direction === "bullish" ? "Demand Zone" : "Supply Zone";
-    addAnnotation(annotations, "ORDER_BLOCK", ob, { label, startTime: ob.time, startIndex: ob.candleIndex, endIndex: ob.mitigatedIndex, status: ob.status });
-  }
-  
+  for (const ob of analysis.orderBlocks ?? []) addAnnotation(annotations, "ORDER_BLOCK", ob, { label: `${ob.direction} order block`, startTime: ob.time, startIndex: ob.candleIndex, endIndex: ob.mitigatedIndex, status: ob.status });
   for (const fvg of analysis.fvg ?? []) addAnnotation(annotations, "FVG", fvg, { label: `${fvg.direction} fair value gap`, startTime: fvg.time, startIndex: fvg.index, endIndex: fvg.mitigatedIndex, status: fvg.status });
 
   const range = analysis.dealingRange;
@@ -188,7 +182,7 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confidence = result.score;
     result.quality = "GOOD";
     result.confidenceLabel = "Good Setup";
-  } else if (result.score >= 30) {
+  } else if (result.score >= 50) { // 👈 MINIMUM SCORE IS NOW 50
     result.decision = result.direction;
     result.confidence = result.score;
     result.quality = "STANDARD";
@@ -196,8 +190,8 @@ export function evaluateSetup(analysis, currentPrice) {
   } else {
     result.decision = "NO_TRADE";
     result.confidenceLabel = "Insufficient confluence";
-    result.reasons.push(`Score ${result.score}/100 did not pass threshold.`);
+    result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 50.`);
   }
 
   return result;
-                           }
+}
