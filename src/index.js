@@ -32,7 +32,6 @@ export default {
   async scheduled(event, env, ctx) {
     console.log("Cron Job Started: Managing trades, watchlist, and scanning...");
     
-    // 1. Fetch single DB state (Only 1 read!)
     const oldAppStateStr = await env.SKY_MEMORY.get("app_state") || '{"pending":[],"completed":[],"news":[]}';
     const oldAppState = JSON.parse(oldAppStateStr);
     
@@ -45,7 +44,7 @@ export default {
     const symbolsToScan = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"];
     const timeframes = ["M15", "H1"];
 
-    // 2. FETCH LIVE PRICES
+    // 1. FETCH LIVE PRICES & WRITE TO CACHE
     for (const symbol of symbolsToScan) {
       try {
         const marketData = await getMarketData(env, symbol, "M15", 1);
@@ -57,7 +56,6 @@ export default {
       }
     }
 
-    // 🟢 WRITE LIVE PRICES TO CACHE (Saves KV Writes & Reads)
     const cache = caches.default;
     const cacheKey = new Request("https://sky-ai-backend.i96463073.workers.dev/api/prices-cache", { method: "GET" });
     const cacheResponse = new Response(JSON.stringify(livePrices), {
@@ -65,7 +63,7 @@ export default {
     });
     ctx.waitUntil(cache.put(cacheKey, cacheResponse));
 
-    // 3. CHECK WATCHLIST FOR ENTRY TRIGGERS
+    // 2. CHECK WATCHLIST
     let newWatchlist = [];
     for (const trade of watchlist) {
       const px = livePrices[trade.symbol];
@@ -104,7 +102,7 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
     }
     watchlist = newWatchlist;
 
-    // 4. MANAGE ACTIVE TRADES (TP/SL)
+    // 3. MANAGE ACTIVE TRADES
     let activeTrades = [];
     for (const trade of pendingTrades) {
       const px = livePrices[trade.symbol];
@@ -155,7 +153,7 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
       }
     }
 
-    // 5. SCAN FOR NEW SIGNALS
+    // 4. SCAN FOR NEW SIGNALS
     for (const symbol of symbolsToScan) {
       for (const tf of timeframes) {
         try {
@@ -199,13 +197,12 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
     completedTrades = completedTrades.slice(0, 50);
     watchlist = watchlist.slice(-20);
 
-    // 🟢 6. DIRTY CHECK: ONLY WRITE IF DATA CHANGED
+    // 🟢 5. DIRTY CHECK: ONLY WRITE IF DATA CHANGED
     const newAppState = { pending: activeTrades, completed: completedTrades, news: news };
     const newAppStateStr = JSON.stringify(newAppState);
 
     if (newAppStateStr !== oldAppStateStr) {
       await env.SKY_MEMORY.put("app_state", newAppStateStr);
-      console.log("Database updated (app_state written).");
     }
 
     const oldWatchlistStr = JSON.stringify(watchlist);
