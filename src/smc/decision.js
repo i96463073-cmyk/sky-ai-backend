@@ -1,52 +1,3 @@
-const MAX_ZONE_DISTANCE_ATR = 2.5; 
-const MAX_EVENT_AGE = 40;          
-
-function finite(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function addAnnotation(out, type, item, extra = {}) {
-  if (!item) return;
-  out.push({
-    id: `${type}-${item.index ?? item.candleIndex ?? item.confirmIndex ?? item.time ?? out.length}`,
-    type, time: item.time ?? null, index: item.index ?? item.candleIndex ?? item.confirmIndex ?? null,
-    price: finite(item.price ?? item.level), top: finite(item.top ?? item.high), bottom: finite(item.bottom ?? item.low),
-    direction: item.direction ?? null, label: type.replaceAll("_", " "), reason: item.why ?? "", ...extra
-  });
-}
-
-export function buildChartAnnotations(analysis, decision = null) {
-  const annotations = [];
-  for (const swing of analysis.swings ?? []) addAnnotation(annotations, "SWING", swing, { label: swing.label ? `${swing.label} ${swing.type}` : `Swing ${swing.type}` });
-  for (const event of analysis.structureEvents ?? []) addAnnotation(annotations, event.type, event, { label: `${event.type} ${event.direction}`, startTime: event.swingTime, startIndex: event.swingIndex });
-  for (const pool of analysis.liquidityPools ?? []) addAnnotation(annotations, "LIQUIDITY", pool, { label: `${pool.kind} ${pool.side}-side liquidity`, formedIndex: pool.formedIndex, status: pool.status });
-  for (const sweep of analysis.sweeps ?? []) addAnnotation(annotations, "LIQUIDITY_SWEEP", sweep, { label: `${sweep.side}-side liquidity swept` });
-  for (const ob of analysis.orderBlocks ?? []) addAnnotation(annotations, "ORDER_BLOCK", ob, { label: `${ob.direction} order block`, startTime: ob.time, startIndex: ob.candleIndex, endIndex: ob.mitigatedIndex, status: ob.status });
-  for (const fvg of analysis.fvg ?? []) addAnnotation(annotations, "FVG", fvg, { label: `${fvg.direction} fair value gap`, startTime: fvg.time, startIndex: fvg.index, endIndex: fvg.mitigatedIndex, status: fvg.status });
-
-  const range = analysis.dealingRange;
-  if (range?.valid) {
-    annotations.push({ id: "DEALING_RANGE", type: "DEALING_RANGE", top: range.high, bottom: range.low, label: "Dealing range", reason: range.why });
-    annotations.push({ id: "EQUILIBRIUM", type: "EQUILIBRIUM", price: finite(range.equilibrium), label: "50% equilibrium", reason: "Midpoint of the selected dealing range." });
-  }
-
-  if (decision?.levels) {
-    for (const [key, value] of Object.entries(decision.levels)) {
-      if (Array.isArray(value)) {
-        value.forEach((v, i) => {
-          if (finite(v) === null) return;
-          annotations.push({ id: `${key.toUpperCase()}_${i + 1}`, type: key.toUpperCase(), price: Number(v), label: `${key.replaceAll("_", " ").toUpperCase()} ${i + 1}`, direction: decision.direction ?? null });
-        });
-      } else {
-        if (finite(value) === null) continue;
-        annotations.push({ id: key.toUpperCase(), type: key.toUpperCase(), price: Number(value), label: key.replaceAll("_", " ").toUpperCase(), direction: decision.direction ?? null });
-      }
-    }
-  }
-  return annotations;
-}
-
 export function evaluateSetup(analysis, currentPrice) {
   const price = finite(currentPrice);
   const atr = finite(analysis.atr?.value);
@@ -142,34 +93,70 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confluence.push("Liquidity Sweep");
   }
 
-  // 6. Session (10 pts)
+  // 6. Session (10 pts) + ASIAN SESSION FILTER
   const now = new Date();
   const eatHour = (now.getUTCHours() + 3) % 24;
-  const isLondon = eatHour >= 11 && eatHour < 15;
-  const isNewYork = eatHour >= 16 && eatHour < 20;
   
-  if (isLondon || isNewYork) {
-    scores.session = 10;
-    result.confluence.push(isLondon ? "London Killzone" : "NY Killzone");
+  // Define killzones based on EAT
+  const isAsian = eatHour >= 2 && eatHour < 10;   // 02:00 - 10:00 EAT (Tokyo/Sydney overlap)
+  const isLondon = eatHour >= 10 && eatHour < 15; // 10:00 - 15:00 EAT
+  const isNewYork = eatHour >= 16 && eatHour < 20; // 16:00 - 20:00 EAT
+
+  // REJECT: Block all trades during Asian session to avoid low-volume chop
+  if (isAsian) {
+    result.reasons.push("Signal rejected: Asian Session (Low liquidity/chop).");
+    return result; 
   }
 
-  // Build the levels
+  // AWARD POINTS: If it's London or NY, give the bonus points
+  if (isLondon || isNewYork) {
+    scores.session = 10;
+    result.confluence.push(isLondon ? "London Session" : "NY Session");
+  }
+
+
+  // ==========================================
+  // SMART STOP LOSS & RISK:REWARD
+  // ==========================================
   result.candidateZone = block ? { top: Number(block.top), bottom: Number(block.bottom), orderBlockTime: block.time, status: block.status } : null;
   
-  const entry = block ? (trend === "bullish" ? Number(block.top) : Number(block.bottom)) : price;
-  const buffer = atr * 0.5; 
-  const stopLoss = trend === "bullish" ? entry - buffer : entry + buffer;
-  const risk = Math.abs(entry - stopLoss);
+  let entry = block ? (trend === "bullish" ? Number(block.top) : Number(block.bottom)) : price;
+  let stopLoss = 0;
 
+  if (block) {
+    // Place SL behind the Order Block + 20% ATR buffer
+    const buffer = atr * 0.2; 
+    let structuralSL = trend === "bullish" ? Number(block.bottom) - buffer : Number(block.top) + buffer;
+    
+    // Ensure minimum distance of 1.5 * ATR to survive market noise
+    const minDistance = atr * 1.5;
+    const currentDistance = Math.abs(entry - structuralSL);
+    
+    if (currentDistance < minDistance) {
+      stopLoss = trend === "bullish" ? entry - minDistance : entry + minDistance;
+    } else {
+      stopLoss = structuralSL;
+    }
+  } else {
+    // No block? Use a wider safety net (2x ATR) to survive noise
+    const buffer = atr * 2.0; 
+    stopLoss = trend === "bullish" ? entry - buffer : entry + buffer;
+  }
+
+  const risk = Math.abs(entry - stopLoss);
   if (!(risk > 0) || !Number.isFinite(risk)) { result.reasons.push("Invalid stop-loss."); return result; }
 
-  const tp1 = trend === "bullish" ? entry + (1 * risk) : entry - (1 * risk);
-  const tp2 = trend === "bullish" ? entry + (2 * risk) : entry - (2 * risk);
-  const tp3 = trend === "bullish" ? entry + (3 * risk) : entry - (3 * risk);
+  // Changed Risk:Reward to 1.5R, 2.5R, 4.0R globally
+  const tp1 = trend === "bullish" ? entry + (1.5 * risk) : entry - (1.5 * risk);
+  const tp2 = trend === "bullish" ? entry + (2.5 * risk) : entry - (2.5 * risk);
+  const tp3 = trend === "bullish" ? entry + (4.0 * risk) : entry - (4.0 * risk);
 
   result.levels = { entry: entry, stop_loss: stopLoss, take_profit: [tp1, tp2, tp3] };
 
-  // Calculate total score
+
+  // ==========================================
+  // STRICTER SCORING
+  // ==========================================
   result.score = scores.htf + scores.liquidity + scores.structure + scores.fvg_ob + scores.supply_demand + scores.session;
 
   if (result.score >= 80) {
@@ -177,20 +164,16 @@ export function evaluateSetup(analysis, currentPrice) {
     result.confidence = result.score;
     result.quality = "HIGH";
     result.confidenceLabel = "High Quality Setup";
-  } else if (result.score >= 60) {
+  } else if (result.score >= 65) { // Minimum score raised to 65
     result.decision = result.direction;
     result.confidence = result.score;
     result.quality = "GOOD";
     result.confidenceLabel = "Good Setup";
-  } else if (result.score >= 50) { // 👈 MINIMUM SCORE IS NOW 50
-    result.decision = result.direction;
-    result.confidence = result.score;
-    result.quality = "STANDARD";
-    result.confidenceLabel = "Standard Setup";
   } else {
+    // Removed the 50-point standard tier. If it's not a Good or High setup, it's a NO_TRADE.
     result.decision = "NO_TRADE";
     result.confidenceLabel = "Insufficient confluence";
-    result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 50.`);
+    result.reasons.push(`Score ${result.score}/100 did not pass the minimum threshold of 65.`);
   }
 
   return result;
