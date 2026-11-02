@@ -30,7 +30,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    console.log("Cron Job Started: Managing trades, watchlist, and scanning...");
+    console.log("Cron Job Started: Scanning ALL pairs...");
     
     const oldAppStateStr = await env.SKY_MEMORY.get("app_state") || '{"pending":[],"completed":[],"news":[]}';
     const oldAppState = JSON.parse(oldAppStateStr);
@@ -38,13 +38,12 @@ export default {
     let pendingTrades = oldAppState.pending || [];
     let completedTrades = oldAppState.completed || [];
     let news = oldAppState.news || [];
-    let watchlist = JSON.parse(await env.SKY_MEMORY.get("watchlist_trades") || "[]");
     let livePrices = {};
     
     const symbolsToScan = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"];
     const timeframes = ["M15", "H1"];
 
-    // 1. FETCH LIVE PRICES & WRITE TO CACHE
+    // 1. FETCH LIVE PRICES
     for (const symbol of symbolsToScan) {
       try {
         const marketData = await getMarketData(env, symbol, "M15", 1);
@@ -56,53 +55,7 @@ export default {
       }
     }
 
-    const cache = caches.default;
-    const cacheKey = new Request("https://sky-ai-backend.i96463073.workers.dev/api/prices-cache", { method: "GET" });
-    const cacheResponse = new Response(JSON.stringify(livePrices), {
-      headers: { "Content-Type": "application/json", "Cache-Control": "s-maxage=300" }
-    });
-    ctx.waitUntil(cache.put(cacheKey, cacheResponse));
-
-    // 2. CHECK WATCHLIST
-    let newWatchlist = [];
-    for (const trade of watchlist) {
-      const px = livePrices[trade.symbol];
-      if (!px) { newWatchlist.push(trade); continue; }
-
-      let isTriggered = false;
-      let isInvalidated = false;
-
-      if (trade.direction === "BUY") {
-        if (px <= trade.entry) isTriggered = true;
-        else if (px <= trade.stop_loss) isInvalidated = true;
-      } else {
-        if (px >= trade.entry) isTriggered = true;
-        else if (px >= trade.stop_loss) isInvalidated = true;
-      }
-
-      if (isTriggered) {
-        console.log(`🎯 Watchlist Triggered: ${trade.symbol} ${trade.timeframe}`);
-        pendingTrades.push(trade); 
-        
-        if (trade.confidence >= 60) {
-          let emoji = trade.quality === "HIGH" ? "🔥" : "⚡";
-          await sendTelegramMessage(env, `
-${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> ${emoji}
-<b>Pair:</b> ${trade.symbol} (${trade.timeframe})
-<b>Direction:</b> ${trade.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
------------------------------------
-<b>Entry:</b> ${trade.entry.toFixed(5)}
-<b>Stop Loss:</b> ${trade.stop_loss.toFixed(5)}
-<b>TP1:</b> ${trade.take_profit[0].toFixed(5)}
-          `.trim());
-        }
-      } else if (!isInvalidated) {
-        newWatchlist.push(trade);
-      }
-    }
-    watchlist = newWatchlist;
-
-    // 3. MANAGE ACTIVE TRADES
+    // 2. MANAGE ACTIVE TRADES (TP/SL)
     let activeTrades = [];
     for (const trade of pendingTrades) {
       const px = livePrices[trade.symbol];
@@ -153,7 +106,7 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
       }
     }
 
-    // 4. SCAN FOR NEW SIGNALS
+    // 3. SCAN FOR NEW SIGNALS
     for (const symbol of symbolsToScan) {
       for (const tf of timeframes) {
         try {
@@ -161,11 +114,8 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
           
           if (res.ok && res.signal && (res.signal.decision === "BUY" || res.signal.decision === "SELL")) {
             
-            const existingActive = activeTrades.filter(t => t.symbol === symbol);
-            const existingWatch = watchlist.filter(t => t.symbol === symbol);
-            
-            if (existingActive.some(t => t.timeframe === tf) || existingWatch.some(t => t.timeframe === tf)) continue;
-            if ((existingActive.length > 0 || existingWatch.length > 0) && res.signal.confidence < 80) continue;
+            const existingActive = activeTrades.find(t => t.symbol === symbol && t.timeframe === tf);
+            if (existingActive) continue; 
 
             const levels = res.signal.levels;
 
@@ -179,14 +129,30 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
               confidence: res.signal.confidence, 
               quality: res.signal.quality,
               breakdown: res.signal.breakdown,
+              is_sd: res.signal.is_sd,
               confluence: res.signal.confluence || [],
               created_at: new Date().toISOString(),
               timeframe: tf,
               tp_hit: 0
             };
 
-            watchlist.push(newTrade);
-            console.log(`👀 Added to Watchlist: ${symbol} ${tf} | Waiting for entry at ${levels.entry}`);
+            activeTrades.push(newTrade);
+            console.log(`🚀 INSTANT SIGNAL: ${symbol} ${tf} | ${newTrade.direction} | S&D: ${newTrade.is_sd}`);
+
+            if (newTrade.confidence >= 60) {
+              let emoji = newTrade.quality === "HIGH" ? "🔥" : "⚡";
+              let sdText = newTrade.is_sd ? "\n<b>✅ Supply/Demand Zone Confirmed</b>" : "";
+              
+              await sendTelegramMessage(env, `
+${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${emoji}
+<b>Pair:</b> ${symbol} (${tf})
+<b>Direction:</b> ${newTrade.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
+-----------------------------------
+<b>Entry:</b> ${levels.entry.toFixed(5)}
+<b>Stop Loss:</b> ${levels.stop_loss.toFixed(5)}
+<b>TP1:</b> ${levels.take_profit[0].toFixed(5)}${sdText}
+              `.trim());
+            }
           }
         } catch (e) {
           console.error(`Error scanning ${symbol} ${tf}:`, e);
@@ -195,20 +161,20 @@ ${emoji} <b>SKY AI ${trade.quality} ENTRY TRIGGERED (${trade.confidence}%)</b> $
     }
 
     completedTrades = completedTrades.slice(0, 50);
-    watchlist = watchlist.slice(-20);
 
-    // 🟢 5. DIRTY CHECK: ONLY WRITE IF DATA CHANGED
+    // 4. WRITE CACHE & DB
+    const cache = caches.default;
+    const cacheKey = new Request("https://sky-ai-backend.i96463073.workers.dev/api/prices-cache", { method: "GET" });
+    const cacheResponse = new Response(JSON.stringify(livePrices), {
+      headers: { "Content-Type": "application/json", "Cache-Control": "s-maxage=300" }
+    });
+    ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+
     const newAppState = { pending: activeTrades, completed: completedTrades, news: news };
     const newAppStateStr = JSON.stringify(newAppState);
 
     if (newAppStateStr !== oldAppStateStr) {
       await env.SKY_MEMORY.put("app_state", newAppStateStr);
-    }
-
-    const oldWatchlistStr = JSON.stringify(watchlist);
-    const newWatchlistStr = JSON.stringify(watchlist);
-    if (newWatchlistStr !== oldWatchlistStr) {
-      await env.SKY_MEMORY.put("watchlist_trades", newWatchlistStr);
     }
   }
 };
