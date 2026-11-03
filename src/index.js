@@ -106,17 +106,27 @@ export default {
       }
     }
 
-    // 3. SCAN FOR NEW SIGNALS
+    // ==========================================
+    // 3. BUILD ACTIVE SYMBOLS LOCK (1 Trade Per Pair)
+    // ==========================================
+    const activeSymbols = activeTrades.map(t => t.symbol.toUpperCase());
+
+    // 4. SCAN FOR NEW SIGNALS
     for (const symbol of symbolsToScan) {
+      
+      // Multi-Timeframe Lock: Skip if this pair already has an open trade
+      if (activeSymbols.includes(symbol)) {
+        // console.log(`Skipping ${symbol} - Pair is locked by an active trade.`);
+        continue; 
+      }
+
       for (const tf of timeframes) {
         try {
-          const res = await getSignal(env, symbol, tf);
+          // Pass the activeSymbols to the engine as a double-check
+          const res = await getSignal(env, symbol, tf, { activeSymbols });
           
           if (res.ok && res.signal && (res.signal.decision === "BUY" || res.signal.decision === "SELL")) {
             
-            const existingActive = activeTrades.find(t => t.symbol === symbol && t.timeframe === tf);
-            if (existingActive) continue; 
-
             const levels = res.signal.levels;
 
             const newTrade = {
@@ -133,15 +143,25 @@ export default {
               confluence: res.signal.confluence || [],
               created_at: new Date().toISOString(),
               timeframe: tf,
-              tp_hit: 0
+              tp_hit: 0,
+              // NEW: Save the Sniper Engine Data for the UI
+              entryStatus: res.signal.entryStatus || "CONFIRMED_ENTRY",
+              watch: res.signal.watch || false,
+              session: res.signal.session || "UNKNOWN",
+              reasons: res.signal.reasons || []
             };
 
             activeTrades.push(newTrade);
-            console.log(`🚀 INSTANT SIGNAL: ${symbol} ${tf} | ${newTrade.direction} | S&D: ${newTrade.is_sd}`);
+            
+            // CRITICAL: Instantly lock this symbol so the next timeframe in the loop skips it
+            activeSymbols.push(symbol); 
+
+            console.log(`🚀 INSTANT SIGNAL: ${symbol} ${tf} | ${newTrade.direction} | Status: ${newTrade.entryStatus}`);
 
             if (newTrade.confidence >= 60) {
               let emoji = newTrade.quality === "HIGH" ? "🔥" : "⚡";
               let sdText = newTrade.is_sd ? "\n<b>✅ Supply/Demand Zone Confirmed</b>" : "";
+              let statusText = newTrade.entryStatus === "WAITING_FOR_CONFIRMATION" ? "\n⏳ <b>Waiting for candle confirmation</b>" : "";
               
               await sendTelegramMessage(env, `
 ${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${emoji}
@@ -150,9 +170,12 @@ ${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${em
 -----------------------------------
 <b>Entry:</b> ${levels.entry.toFixed(5)}
 <b>Stop Loss:</b> ${levels.stop_loss.toFixed(5)}
-<b>TP1:</b> ${levels.take_profit[0].toFixed(5)}${sdText}
+<b>TP1:</b> ${levels.take_profit[0].toFixed(5)}${sdText}${statusText}
               `.trim());
             }
+            
+            // Break the inner loop (timeframes) since we just found a trade and locked the symbol
+            break; 
           }
         } catch (e) {
           console.error(`Error scanning ${symbol} ${tf}:`, e);
@@ -162,7 +185,7 @@ ${emoji} <b>SKY AI ${newTrade.quality} SIGNAL (${newTrade.confidence}%)</b> ${em
 
     completedTrades = completedTrades.slice(0, 50);
 
-    // 4. WRITE CACHE & DB
+    // 5. WRITE CACHE & DB
     const cache = caches.default;
     const cacheKey = new Request("https://sky-ai-backend.i96463073.workers.dev/api/prices-cache", { method: "GET" });
     const cacheResponse = new Response(JSON.stringify(livePrices), {
