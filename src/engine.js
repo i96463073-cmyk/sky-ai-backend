@@ -9,13 +9,12 @@ import {
   buildChartAnnotations
 } from "./smc/decision.js";
 
-const ENGINE_VERSION = "2.2.0";
+const ENGINE_VERSION = "2.3.0";
 const DEFAULT_CANDLE_LIMIT = 300;
 const MIN_CLOSED_CANDLES = 30;
 const HTF_CANDLE_LIMIT = 200;
 
 // Higher timeframe used to confirm the trend of each timeframe.
-// Timeframes not listed here get no signals (fail closed).
 const HTF_MAP = {
   M5: "H1",
   M15: "H1",
@@ -115,11 +114,6 @@ function buildErrorResult({
   };
 }
 
-/**
- * Fetch the higher timeframe and return its trend.
- * Never throws: on any problem it returns trend = null and an error message,
- * and the decision engine then rejects the setup.
- */
 async function loadHtfTrend(env, symbolKey, tfKey) {
   const htfKey = HTF_MAP[tfKey] ?? null;
   if (!htfKey || !TIMEFRAMES[htfKey]) {
@@ -148,9 +142,6 @@ async function loadHtfTrend(env, symbolKey, tfKey) {
   }
 }
 
-/**
- * Run the complete market-data + SMC + setup evaluation pipeline.
- */
 export async function getSignal(
   env,
   symbolKey = "XAUUSD",
@@ -159,8 +150,10 @@ export async function getSignal(
 ) {
   const startedAt = Date.now();
 
-  // Gold on 15m is banned (excessive volatility)
-  if (symbolKey === "XAUUSD" && tfKey === "M15") {
+  // ==========================================
+  // MULTI-TIMEFRAME LOCK (1 Trade Per Pair)
+  // ==========================================
+  if (options.activeSymbols && options.activeSymbols.includes(symbolKey)) {
     return {
       ok: false,
       engineVersion: ENGINE_VERSION,
@@ -171,27 +164,17 @@ export async function getSignal(
         decision: "NO_TRADE",
         direction: null,
         score: 0,
-        reasons: ["XAUUSD (Gold) on 15m timeframe is banned due to excessive volatility."]
+        reasons: [`${symbolKey} already has an active trade. Skipping to prevent multi-timeframe overlap.`]
       }
     };
   }
 
   if (!SYMBOLS[symbolKey]) {
-    return buildErrorResult({
-      symbol: symbolKey,
-      timeframe: tfKey,
-      message: `Unsupported symbol: ${symbolKey}`,
-      startedAt
-    });
+    return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: `Unsupported symbol: ${symbolKey}`, startedAt });
   }
 
   if (!TIMEFRAMES[tfKey]) {
-    return buildErrorResult({
-      symbol: symbolKey,
-      timeframe: tfKey,
-      message: `Unsupported timeframe: ${tfKey}`,
-      startedAt
-    });
+    return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: `Unsupported timeframe: ${tfKey}`, startedAt });
   }
 
   const requestedLimit = Number(options.limit);
@@ -200,20 +183,12 @@ export async function getSignal(
     : DEFAULT_CANDLE_LIMIT;
 
   try {
-    // 1. Fetch market data
     const market = await getMarketData(env, symbolKey, tfKey, candleLimit);
 
     if (!market || market.ok !== true) {
-      return buildErrorResult({
-        symbol: symbolKey,
-        timeframe: tfKey,
-        message: market?.error || "Market data provider returned no valid data.",
-        startedAt,
-        extra: { provider: market?.provider ?? "unknown" }
-      });
+      return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: market?.error || "Market data provider returned no valid data.", startedAt, extra: { provider: market?.provider ?? "unknown" } });
     }
 
-    // 2. Use only completed candles
     const closedCandles = getClosedCandles(market.candles);
     const quality = getQuality(market, closedCandles);
     const freshness = assessFreshness(closedCandles, tfKey, Date.now());
@@ -235,7 +210,6 @@ export async function getSignal(
       freshness
     };
 
-    // 3. Check for sufficient data
     if (closedCandles.length < MIN_CLOSED_CANDLES) {
       return {
         ok: false,
@@ -246,41 +220,20 @@ export async function getSignal(
         timeframe: tfKey,
         market: marketSummary,
         signal: {
-          decision: "NO_TRADE",
-          direction: null,
-          watch: false,
-          score: 0,
-          maxScore: null,
-          confidenceLabel: "INSUFFICIENT_DATA",
-          reasons: [
-            `Only ${closedCandles.length} valid closed candles are available.`,
-            `At least ${MIN_CLOSED_CANDLES} are required by this engine wrapper.`
-          ],
-          evidence: [],
-          candidateZone: null,
-          levels: null,
-          entryStatus: "NOT_EVALUATED"
+          decision: "NO_TRADE", direction: null, watch: false, score: 0, maxScore: null, confidenceLabel: "INSUFFICIENT_DATA",
+          reasons: [`Only ${closedCandles.length} valid closed candles are available.`, `At least ${MIN_CLOSED_CANDLES} are required.`],
+          evidence: [], candidateZone: null, levels: null, entryStatus: "NOT_EVALUATED"
         },
-        analysis: null,
-        annotations: [],
-        processingMs: Date.now() - startedAt
+        analysis: null, annotations: [], processingMs: Date.now() - startedAt
       };
     }
 
-    // 4. Run SMC analysis
     const analysis = analyze(closedCandles, tfKey);
 
     if (!analysis || analysis.ok !== true) {
-      return buildErrorResult({
-        symbol: symbolKey,
-        timeframe: tfKey,
-        message: analysis?.error || "SMC analysis failed or returned an invalid result.",
-        startedAt,
-        extra: { market: marketSummary, analysis: jsonSafe(analysis) }
-      });
+      return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: analysis?.error || "SMC analysis failed.", startedAt, extra: { market: marketSummary, analysis: jsonSafe(analysis) } });
     }
 
-    // 5. Higher-timeframe trend (only fetched when there is a trend worth confirming)
     const ltfTrend = String(analysis.trend ?? "").toLowerCase();
     let htf = { timeframe: null, trend: null, error: null };
 
@@ -290,7 +243,6 @@ export async function getSignal(
       htf = await loadHtfTrend(env, symbolKey, tfKey);
     }
 
-    // 6. Evaluate the setup
     const currentPrice = chartCandles[chartCandles.length - 1].close;
     const lastClosed = closedCandles[closedCandles.length - 1];
 
@@ -308,16 +260,9 @@ export async function getSignal(
     });
 
     if (!setup || typeof setup !== "object") {
-      return buildErrorResult({
-        symbol: symbolKey,
-        timeframe: tfKey,
-        message: "Setup evaluator returned no valid result.",
-        startedAt,
-        extra: { market: marketSummary, analysis: jsonSafe(analysis) }
-      });
+      return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: "Setup evaluator returned no valid result.", startedAt, extra: { market: marketSummary, analysis: jsonSafe(analysis) } });
     }
 
-    // 7. Create annotations
     const annotations = buildChartAnnotations(analysis, setup);
     const decision = setup.decision ?? "NO_TRADE";
 
@@ -354,30 +299,12 @@ export async function getSignal(
     };
 
   } catch (error) {
-    console.error("SKY AI SIGNAL ENGINE ERROR", {
-      symbol: symbolKey,
-      timeframe: tfKey,
-      message: error?.message,
-      stack: error?.stack
-    });
-
-    return buildErrorResult({
-      symbol: symbolKey,
-      timeframe: tfKey,
-      message: error?.message || "Unexpected signal engine error.",
-      startedAt
-    });
+    console.error("SKY AI SIGNAL ENGINE ERROR", { symbol: symbolKey, timeframe: tfKey, message: error?.message, stack: error?.stack });
+    return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: error?.message || "Unexpected signal engine error.", startedAt });
   }
 }
 
-/**
- * Compatibility wrapper
- */
-export async function runSignalEngine(
-  env,
-  symbolKey = "XAUUSD",
-  tfKey = "M15"
-) {
+export async function runSignalEngine(env, symbolKey = "XAUUSD", tfKey = "M15") {
   const result = await getSignal(env, symbolKey, tfKey);
   return JSON.stringify(result);
-}
+            }
