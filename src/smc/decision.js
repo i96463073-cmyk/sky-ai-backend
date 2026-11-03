@@ -9,7 +9,7 @@ const MIN_SIGNAL_SCORE = 95;         // baseline of mandatory gates = 90, so FVG
 const MIN_STOP_ATR = 1.5;
 const MAX_STOP_ATR = 3.0;            // reject setups with a huge stop
 const STOP_BUFFER_ATR = 0.2;
-const TP_R_MULTIPLES = [1, 2, 3];    // TP1 / TP2 / TP3 in R. Use [2, 3, 4] for the old 1:2 / 1:3 / 1:4
+const TP_R_MULTIPLES = [2, 3, 4];    // TP1 (1:2), TP2 (1:3), TP3 (1:4) -- UPDATED FOR MAX PROFIT
 
 function finite(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -374,4 +374,4 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   result.reasons.push("All mandatory filters passed and entry candle confirmed.");
 
   return result;
-}
+                  }
