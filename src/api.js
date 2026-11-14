@@ -1,9 +1,20 @@
 import { SYMBOLS, TIMEFRAMES } from "./market/symbols.js";
 import { getMarketData, assessFreshness, isMarketClosed } from "./market/biquote.js";
 import { analyze } from "./smc/analyze.js";
-import { ENGINE_VERSION, getClosedCandles } from "./engine.js";
+import { ENGINE_VERSION, getClosedCandles, getSignal } from "./engine.js";
 
-export const API_VERSION = "signals-api-0.4.0";
+export const API_VERSION = "signals-api-0.5.0";
+
+// "Signals today" counter. Must match the engine's daily target and day boundary (EAT).
+const DAILY_TARGET = 3;
+const DAY_TZ = "Africa/Nairobi";
+function dayKey(ms) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", { timeZone: DAY_TZ, year: "numeric", month: "2-digit", day: "2-digit" })
+      .formatToParts(new Date(ms)).map((x) => [x.type, x.value])
+  );
+  return `${p.year}-${p.month}-${p.day}`;
+}
 
 const MIN_CLOSED_CANDLES = 30;
 
@@ -141,16 +152,32 @@ export async function handleApi(request, env = {}) {
     // Fresh prices (max ~60s old) plus an honest freshness report
     const { prices: live_prices, meta: prices_meta } = await getLivePrices(env);
 
+    const dk = dayKey(now);
+    const daily = { date: dk, count: Number(appState.tracker?.daily?.[dk] ?? 0), target: DAILY_TARGET };
+
     return reply({
       ok: true,
       api_version: API_VERSION,
       engine_version: ENGINE_VERSION,
+      daily,
       live_prices,
       prices_meta,
       pending,
       completed,
       news
     });
+  }
+
+  // Chart data for the app (same payload as /test-signal, but always public so you can lock /test-* with ADMIN_KEY).
+  if (url.pathname === "/api/chart") {
+    const symbol = String(url.searchParams.get("symbol") || "XAUUSD").toUpperCase();
+    const tfKey = String(url.searchParams.get("timeframe") || url.searchParams.get("tf") || "M15").toUpperCase();
+    if (!SYMBOLS[symbol] || !TIMEFRAMES[tfKey]) return fail(400, "BAD_PARAMS", "Invalid symbol or timeframe");
+    try {
+      return reply(await getSignal(env, symbol, tfKey));
+    } catch (e) {
+      return fail(500, "CHART_FAIL", String(e?.message || e));
+    }
   }
 
   if (url.pathname === "/api/analysis") {
