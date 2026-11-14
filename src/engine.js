@@ -710,10 +710,10 @@ export function evaluateWithQuota(analysis, currentPrice, options = {}, tracker 
 // ######################################################
 // PART 2: DATA, ANALYSIS AND ALL-PAIRS SCANNER
 // ######################################################
-const ENGINE_VERSION = "3.0.0";
-const DEFAULT_CANDLE_LIMIT = 300;
+export const ENGINE_VERSION = "3.1.0";
+export const DEFAULT_CANDLE_LIMIT = 300;
 const MIN_CLOSED_CANDLES = 30;
-const HTF_CANDLE_LIMIT = 200;
+const HTF_CANDLE_LIMIT = DEFAULT_CANDLE_LIMIT;   // same limit so higher-timeframe data is shared
 const SCAN_CONCURRENCY = 4;          // parallel data fetches
 const MAX_CURRENCY_EXPOSURE = 2;     // max same-side trades on one currency (e.g. long USD x2)
 
@@ -731,7 +731,7 @@ function jsonSafe(value) {
   } catch { return null; }
 }
 
-function getClosedCandles(candles) {
+export function getClosedCandles(candles) {
   if (!Array.isArray(candles)) return [];
   return candles
     .filter(c => c && c.closed === true)
@@ -791,6 +791,18 @@ async function mapPool(items, limit, fn) {
   return out;
 }
 
+// One market-data request per symbol/timeframe per run (saves Worker subrequests).
+// Pass the same Map to every call in a run (index.js shares it with scanAll).
+export function fetchMarketCached(env, symbol, tf, limit, cache) {
+  if (!cache) return getMarketData(env, symbol, tf, limit);
+  const key = `${symbol}:${tf}:${limit}`;
+  if (!cache.has(key)) {
+    cache.set(key, Promise.resolve(getMarketData(env, symbol, tf, limit))
+      .catch(e => ({ ok: false, error: e?.message || "fetch failed" })));
+  }
+  return cache.get(key);
+}
+
 // Currency exposure: BUY EURUSD = +EUR, -USD
 function exposureDelta(symbol, direction) {
   const base = symbol.slice(0, 3), quote = symbol.slice(3, 6);
@@ -813,7 +825,7 @@ function addExposure(exposure, symbol, direction) {
 // ======================================================
 // HTF TREND (cached per scan so M5 and M15 share one H1 fetch)
 // ======================================================
-async function loadHtfTrend(env, symbolKey, tfKey, cache) {
+async function loadHtfTrend(env, symbolKey, tfKey, cache, marketCache) {
   const htfKey = HTF_MAP[tfKey] ?? null;
   if (!htfKey || !TIMEFRAMES[htfKey]) {
     return { timeframe: htfKey, trend: null, error: `No usable higher timeframe for ${tfKey}.` };
@@ -823,7 +835,7 @@ async function loadHtfTrend(env, symbolKey, tfKey, cache) {
 
   const job = (async () => {
     try {
-      const m = await getMarketData(env, symbolKey, htfKey, HTF_CANDLE_LIMIT);
+      const m = await fetchMarketCached(env, symbolKey, htfKey, HTF_CANDLE_LIMIT, marketCache);
       if (!m || m.ok !== true) return { timeframe: htfKey, trend: null, error: m?.error || `${htfKey} data unavailable.` };
       const closed = getClosedCandles(m.candles);
       if (closed.length < MIN_CLOSED_CANDLES) return { timeframe: htfKey, trend: null, error: `Not enough ${htfKey} candles.` };
@@ -852,7 +864,7 @@ async function prepare(env, symbolKey, tfKey, options = {}) {
   const limit = Number.isInteger(req) ? Math.max(50, Math.min(req, 500)) : DEFAULT_CANDLE_LIMIT;
 
   try {
-    const market = await getMarketData(env, symbolKey, tfKey, limit);
+    const market = await fetchMarketCached(env, symbolKey, tfKey, limit, options.marketCache);
     if (!market || market.ok !== true) {
       return fail(market?.error || "Market data provider returned no valid data.", { provider: market?.provider ?? "unknown" });
     }
@@ -900,8 +912,8 @@ async function prepare(env, symbolKey, tfKey, options = {}) {
     let htf = { timeframe: null, trend: null, error: null };
     if (options.htfTrend) {
       htf = { timeframe: "manual", trend: String(options.htfTrend).toLowerCase(), error: null };
-    } else if (ltfTrend === "bullish" || ltfTrend === "bearish") {
-      htf = await loadHtfTrend(env, symbolKey, tfKey, options.htfCache);
+    } else if (!options.deferHtf && (ltfTrend === "bullish" || ltfTrend === "bearish")) {
+      htf = await loadHtfTrend(env, symbolKey, tfKey, options.htfCache, options.marketCache);
     }
 
     return { ok: true, ctx: { symbolKey, tfKey, startedAt, market, marketSummary, closedCandles, chartCandles, analysis, htf } };
@@ -967,6 +979,7 @@ function decide(ctx, opts = {}) {
     symbol: symbolKey, symbolName: SYMBOLS[symbolKey].name, timeframe: tfKey,
     provider: market.provider ?? "unknown", fetchedAt: market.fetchedAt ?? null, cached: Boolean(market.cached),
     processingMs: Date.now() - startedAt,
+    price: currentPrice,
     htf: { timeframe: htf.timeframe, trend: htf.trend },
     market: marketSummary,
     analysis: jsonSafe(analysis),
@@ -976,6 +989,8 @@ function decide(ctx, opts = {}) {
       decision, direction: setup.direction ?? null, watch: Boolean(setup.watch),
       tier: setup.tier ?? null, quality: setup.quality ?? null,
       score: setup.score ?? null, maxScore: setup.maxScore ?? null,
+      confidence: setup.confidence ?? null, confluence: jsonSafe(setup.confluence ?? []),
+      breakdown: jsonSafe(setup.breakdown ?? null), is_sd: Boolean(setup.is_sd),
       confidenceLabel: setup.confidenceLabel ?? null, session: setup.session ?? null,
       reasons: jsonSafe(setup.reasons ?? []), evidence: jsonSafe(setup.evidence ?? []),
       candidateZone: jsonSafe(setup.candidateZone ?? null), levels: jsonSafe(setup.levels ?? null),
@@ -1018,86 +1033,135 @@ async function saveTracker(env, tracker) {
 
 // ======================================================
 // SCAN ALL PAIRS
-// options: { symbols, timeframes, tracker, activeSymbols, concurrency, account, htfLevels, timestamp }
-// Pass 1: strict rules on every pair/timeframe.
-// Pass 2: only if under the daily target and the relaxed tier is unlocked,
-//         try relaxed (B-grade) on the leftovers, best candidates first.
+// options: { symbols, timeframes, tracker, activeSymbols, openTrades, marketCache, concurrency,
+//            account, htfLevels, timestamp, full }
+// - Skips the whole scan (no data calls) outside London/NY sessions.
+// - Pass 1 (strict): every pair x timeframe, higher-priority timeframe first.
+// - Pass 2 (relaxed): only when under the daily target and unlocked.
+// - Returns one best candidate per symbol (confirmed beats forming).
 // ======================================================
 export async function scanAll(env, options = {}) {
   const startedAt = Date.now();
   const symbols = options.symbols ?? Object.keys(SYMBOLS);
-  const timeframes = options.timeframes ?? ["M15", "M5"];   // higher timeframe first: it wins the pair lock
+  const timeframes = options.timeframes ?? ["M15", "H1"];
+  const ownTracker = !options.tracker;
   const tracker = options.tracker ?? await loadTracker(env);
+  const nowTs = options.timestamp ?? Date.now();
+  const concurrency = options.concurrency ?? SCAN_CONCURRENCY;
+
+  const session = getTradingSession(nowTs);
+  const strictSession = session === "LONDON_OPEN" || session === "NY_OPEN";
+  const q0 = tracker.quota(nowTs);
+  const relaxedActive = q0.relaxedUnlocked && (strictSession || session === "LONDON_MID" || session === "NY_MID");
+
+  const out = {
+    ok: true, engineVersion: ENGINE_VERSION, session, strictSession, relaxedActive,
+    scanned: { symbols: symbols.length, timeframes, combos: symbols.length * timeframes.length },
+    quota: q0, signals: [], candidates: [], prices: {}, rejections: {}, errors: [], skipped: null
+  };
+  if (!strictSession && !relaxedActive) {
+    out.skipped = `Session ${session}: strict tier needs London/NY open; relaxed tier is ${q0.met ? "not needed (quota met)" : "locked"}.`;
+    out.processingMs = Date.now() - startedAt;
+    return out;
+  }
+
   const activeSymbols = [...(options.activeSymbols ?? [])];
   const exposure = {};
+  for (const t of options.openTrades ?? []) addExposure(exposure, String(t.symbol).toUpperCase(), t.direction);
   const htfCache = new Map();
-  const nowTs = options.timestamp ?? Date.now();
+  const marketCache = options.marketCache ?? new Map();
 
-  // fetch + analyse everything in parallel (limited)
+  // fetch + analyse everything (HTF resolved afterwards so H1 data is reused)
   const jobs = symbols.flatMap(s => timeframes.map(tf => ({ s, tf })));
-  const prepared = await mapPool(jobs, options.concurrency ?? SCAN_CONCURRENCY,
-    ({ s, tf }) => prepare(env, s, tf, { ...options, htfCache }));
+  const prepared = await mapPool(jobs, concurrency,
+    ({ s, tf }) => prepare(env, s, tf, { ...options, htfCache, marketCache, deferHtf: true }));
 
-  const errors = [];
-  const evaluated = [];   // { ctx, result }
-  const signals = [];
-  const base = { tracker, activeSymbols, exposure, account: options.account, htfLevels: options.htfLevels, timestamp: options.timestamp };
+  const okCtx = [];
+  for (const p of prepared) {
+    if (p.ok) okCtx.push(p.ctx);
+    else out.errors.push({
+      symbol: p.result.symbol, timeframe: p.result.timeframe, status: p.result.status,
+      error: p.result.error ?? p.result.signal?.reasons?.[0] ?? "unknown"
+    });
+  }
 
+  const bySymTf = new Map(okCtx.map(c => [`${c.symbolKey}:${c.tfKey}`, c]));
+  await mapPool(okCtx, concurrency, async ctx => {
+    const ltf = String(ctx.analysis.trend ?? "").toLowerCase();
+    if (options.htfTrend) { ctx.htf = { timeframe: "manual", trend: String(options.htfTrend).toLowerCase(), error: null }; return; }
+    if (ltf !== "bullish" && ltf !== "bearish") return;
+    const htfKey = HTF_MAP[ctx.tfKey];
+    const same = bySymTf.get(`${ctx.symbolKey}:${htfKey}`);
+    if (same) {
+      ctx.htf = { timeframe: htfKey, trend: String(same.analysis.trend ?? "").toLowerCase() || null, error: null };
+    } else {
+      ctx.htf = await loadHtfTrend(env, ctx.symbolKey, ctx.tfKey, htfCache, marketCache);
+    }
+  });
+
+  for (const ctx of okCtx) {
+    const last = ctx.chartCandles.at(-1)?.close;
+    if (last !== undefined && (ctx.tfKey === "M15" || out.prices[ctx.symbolKey] === undefined)) out.prices[ctx.symbolKey] = last;
+  }
+
+  const all = [];   // { ctx, result, mode }
+  const base = { tracker, activeSymbols, exposure, account: options.account, htfLevels: options.htfLevels, timestamp: nowTs };
   const accept = result => {
-    signals.push(result);
+    result.signal.daily_count = tracker.quota(nowTs).count;
+    out.signals.push(result);
     activeSymbols.push(result.symbol);
     addExposure(exposure, result.symbol, result.signal.decision);
   };
 
   // PASS 1: strict
-  for (const p of prepared) {
-    if (!p.ok) { errors.push({ symbol: p.result.symbol, timeframe: p.result.timeframe, status: p.result.status, error: p.result.error ?? p.result.signal?.reasons?.[0] }); continue; }
-    const result = decide(p.ctx, { ...base, mode: "strict" });
-    evaluated.push({ ctx: p.ctx, result });
-    if (result.status === "SETUP_FOUND") accept(result);
-  }
-
-  // PASS 2: relaxed top-up toward the daily target
-  const q0 = tracker.quota(nowTs);
-  if (q0.relaxedUnlocked) {
-    const leftovers = evaluated
-      .filter(e => e.result.status === "SETUP_FORMING" || e.result.status === "NO_TRADE")
-      .sort((a, b) => (b.result.status === "SETUP_FORMING") - (a.result.status === "SETUP_FORMING")
-        || (b.result.signal?.score ?? 0) - (a.result.signal?.score ?? 0));
-    for (const e of leftovers) {
-      if (tracker.quota(nowTs).met) break;
-      if (activeSymbols.includes(e.ctx.symbolKey)) continue;
-      const r = decide(e.ctx, { ...base, mode: "relaxed" });
-      if (r.status === "SETUP_FOUND") accept(r);
+  const strictByCtx = new Map();
+  if (strictSession) {
+    for (const ctx of okCtx) {
+      const result = decide(ctx, { ...base, mode: "strict" });
+      strictByCtx.set(ctx, result);
+      all.push({ ctx, result, mode: "strict" });
+      if (result.status === "SETUP_FOUND") accept(result);
     }
   }
 
-  // summary: which gate rejects most (use this to tune constants)
-  const rejections = {};
-  for (const e of evaluated) {
-    if (e.result.status !== "NO_TRADE") continue;
-    const why = String(e.result.signal?.reasons?.at(-1) ?? "unknown").replace(/[\d.]+/g, "#");
-    rejections[why] = (rejections[why] ?? 0) + 1;
+  // PASS 2: relaxed top-up toward the daily target
+  if (relaxedActive) {
+    const order = [...okCtx].sort((a, b) =>
+      (strictByCtx.get(b)?.status === "SETUP_FORMING") - (strictByCtx.get(a)?.status === "SETUP_FORMING"));
+    for (const ctx of order) {
+      if (tracker.quota(nowTs).met) break;
+      if (activeSymbols.includes(ctx.symbolKey)) continue;
+      const result = decide(ctx, { ...base, mode: "relaxed" });
+      all.push({ ctx, result, mode: "relaxed" });
+      if (result.status === "SETUP_FOUND") accept(result);
+    }
   }
 
-  await saveTracker(env, tracker);
+  // best candidate per symbol
+  const rank = r => (r.status === "SETUP_FOUND" ? 1000 : 0) + (r.signal?.score ?? 0);
+  const best = new Map();
+  for (const { result } of all) {
+    if (result.status !== "SETUP_FOUND" && result.status !== "SETUP_FORMING") continue;
+    const cur = best.get(result.symbol);
+    if (!cur || rank(result) > rank(cur)) best.set(result.symbol, result);
+  }
 
-  const forming = evaluated
-    .filter(e => e.result.status === "SETUP_FORMING")
-    .map(e => ({ symbol: e.result.symbol, timeframe: e.result.timeframe, direction: e.result.signal.direction,
-      entryStatus: e.result.signal.entryStatus, score: e.result.signal.score, levels: e.result.signal.levels }));
+  // which gate rejects most (tune constants with this)
+  const mainMode = strictSession ? "strict" : "relaxed";
+  for (const { result, mode } of all) {
+    if (mode !== mainMode || result.status !== "NO_TRADE") continue;
+    const why = String(result.signal?.reasons?.at(-1) ?? "unknown").replace(/[\d.]+/g, "#");
+    out.rejections[why] = (out.rejections[why] ?? 0) + 1;
+  }
 
-  return {
-    ok: true,
-    engineVersion: ENGINE_VERSION,
-    scanned: { symbols: symbols.length, timeframes, combos: jobs.length },
-    quota: tracker.quota(nowTs),
-    signals: signals.sort((a, b) => (b.signal.score ?? 0) - (a.signal.score ?? 0)),
-    forming,
-    rejections,
-    errors,
-    processingMs: Date.now() - startedAt
-  };
+  if (ownTracker) await saveTracker(env, tracker);
+
+  const slim = r => options.full ? r : (({ market, analysis, setup, annotations, ...rest }) => rest)(r);
+  out.signals = out.signals.sort((a, b) => (b.signal.score ?? 0) - (a.signal.score ?? 0)).map(slim);
+  out.candidates = [...best.values()].map(slim);
+  out.quota = tracker.quota(nowTs);
+  out.processingMs = Date.now() - startedAt;
+  return out;
 }
 
 export async function runScanner(env, options = {}) {
