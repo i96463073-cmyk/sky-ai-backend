@@ -1,22 +1,26 @@
 import { SYMBOLS, TIMEFRAMES } from "./market/symbols.js";
-import { getMarketData, assessFreshness, providerState, isMarketClosed } from "./market/biquote.js";
+import { getMarketData, assessFreshness, isMarketClosed } from "./market/biquote.js";
 import { analyze } from "./smc/analyze.js";
-import { ENGINE_VERSION } from "./smc/config.js";
+import { ENGINE_VERSION, getClosedCandles } from "./engine.js";
 
-export const API_VERSION = "signals-api-0.3.0";
+export const API_VERSION = "signals-api-0.4.0";
 
-const HEADERS = {
-  "Content-Type": "application/json; charset=UTF-8",
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+const MIN_CLOSED_CANDLES = 30;
 
-const reply = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: HEADERS });
-const fail = (status, code, message) => reply({ ok: false, error: { code, message } }, status);
+// Set an ALLOWED_ORIGIN variable (e.g. https://your-dashboard.pages.dev) to stop other
+// websites from reading your signals. If it is not set, any site can read them ("*").
+function corsHeaders(env) {
+  return {
+    "Content-Type": "application/json; charset=UTF-8",
+    "Access-Control-Allow-Origin": env?.ALLOWED_ORIGIN || "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Vary": "Origin"
+  };
+}
 
-// Same pairs the cron job scans.
-const LIVE_SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"];
+// Every pair in market/symbols.js (same list the cron job scans).
+const LIVE_SYMBOLS = Object.keys(SYMBOLS);
 
 // Fetches the newest M15 candle close for every pair straight from the market-data
 // connector (which caches for 60s per Worker instance and de-duplicates requests).
@@ -26,7 +30,7 @@ async function getLivePrices(env) {
   const now = Date.now();
 
   const rows = await Promise.all(
-    LIVE_SYMBOLS.filter((s) => SYMBOLS[s]).map(async (symbol) => {
+    LIVE_SYMBOLS.map(async (symbol) => {
       try {
         const d = await getMarketData(env, symbol, "M15", 1);
         if (!d || !d.ok || !d.candles || d.candles.length === 0) return { symbol, ok: false };
@@ -97,6 +101,10 @@ async function getLivePrices(env) {
 }
 
 export async function handleApi(request, env = {}) {
+  const HEADERS = corsHeaders(env);
+  const reply = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: HEADERS });
+  const fail = (status, code, message) => reply({ ok: false, error: { code, message } }, status);
+
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: HEADERS });
 
   const url = new URL(request.url);
@@ -104,13 +112,18 @@ export async function handleApi(request, env = {}) {
   if (url.pathname === "/api/signals" || url.pathname === "/api/live") {
     if (!env.SKY_MEMORY) return fail(500, "NO_DB", "Database not configured");
 
-    // 1 KV READ: everything stored by the cron job lives in one key
-    const appStateStr = (await env.SKY_MEMORY.get("app_state")) || '{"pending":[],"completed":[],"news":[]}';
-    const appState = JSON.parse(appStateStr);
+    // 1 KV READ: everything stored by the cron job lives in one key.
+    // A corrupt value must not take the dashboard down, so parsing is guarded.
+    let appState = {};
+    try {
+      appState = JSON.parse((await env.SKY_MEMORY.get("app_state")) || "{}") || {};
+    } catch (e) {
+      console.error("Corrupt app_state in /api/signals:", e);
+    }
 
-    const pendingRaw = appState.pending || [];
-    const completed = appState.completed || [];
-    const news = appState.news || [];
+    const pendingRaw = Array.isArray(appState.pending) ? appState.pending : [];
+    const completed = Array.isArray(appState.completed) ? appState.completed : [];
+    const news = Array.isArray(appState.news) ? appState.news : [];
 
     // Filter out trades older than 12 hours
     const now = Date.now();
@@ -128,7 +141,16 @@ export async function handleApi(request, env = {}) {
     // Fresh prices (max ~60s old) plus an honest freshness report
     const { prices: live_prices, meta: prices_meta } = await getLivePrices(env);
 
-    return reply({ ok: true, live_prices, prices_meta, pending, completed, news });
+    return reply({
+      ok: true,
+      api_version: API_VERSION,
+      engine_version: ENGINE_VERSION,
+      live_prices,
+      prices_meta,
+      pending,
+      completed,
+      news
+    });
   }
 
   if (url.pathname === "/api/analysis") {
@@ -137,12 +159,18 @@ export async function handleApi(request, env = {}) {
     if (!SYMBOLS[symbol] || !TIMEFRAMES[tfKey]) return fail(400, "BAD_PARAMS", "Invalid symbol or timeframe");
 
     const data = await getMarketData(env, symbol, tfKey, 300);
-    if (!data.ok) return fail(502, "DATA_FAIL", "Data fetch failed");
+    if (!data || !data.ok) return fail(502, "DATA_FAIL", "Data fetch failed");
 
-    const result = analyze(data.candles, tfKey);
+    // Use CLOSED candles only, exactly like the signal engine, so charts match the signals.
+    const closed = getClosedCandles(data.candles);
+    if (closed.length < MIN_CLOSED_CANDLES) {
+      return fail(422, "NOT_ENOUGH_DATA", `Only ${closed.length} closed candles available; need ${MIN_CLOSED_CANDLES}.`);
+    }
+
+    const result = analyze(closed, tfKey);
     if (!result.ok) return fail(422, result.code, result.message);
 
-    return reply({ ok: true, symbol, timeframe: tfKey, analysis: result });
+    return reply({ ok: true, engine_version: ENGINE_VERSION, symbol, timeframe: tfKey, analysis: result });
   }
 
   return fail(404, "NOT_FOUND", "Unknown API route");
