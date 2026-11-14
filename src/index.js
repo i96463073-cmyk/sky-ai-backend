@@ -1,21 +1,38 @@
 import { handleApi } from "./api.js";
-import { getSignal } from "./engine.js";
-import { getMarketData } from "./market/biquote.js";
+import { SYMBOLS } from "./market/symbols.js";
+import {
+  getSignal,
+  scanAll,
+  SignalTracker,
+  fetchMarketCached,
+  DEFAULT_CANDLE_LIMIT
+} from "./engine.js";
 
 // ============================================================
 // CONFIG
 // ============================================================
+const SYMBOL_LIST = Object.keys(SYMBOLS);   // every pair in market/symbols.js
+
 const CONFIG = {
-  symbols: ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"],
-  timeframes: ["M15", "H1"],
-  priceCandles: 3,          // recent M15 candles fetched per symbol (for wick-aware TP/SL checks)
-  candleMs: 15 * 60 * 1000, // M15 candle length
+  timeframes: ["M15", "H1"],      // higher-priority timeframe first
+  candleMs: 15 * 60 * 1000,       // M15 candle length (used to read price candles)
+  tfMs: { M5: 5 * 60e3, M15: 15 * 60e3, M30: 30 * 60e3, H1: 60 * 60e3, H4: 4 * 60 * 60e3 },
   maxCompleted: 50,
-  watchExpiryHours: 12,     // forming setups / unfilled entries are dropped after this
-  cooldownMinutes: 60,      // no new signal on a symbol right after its trade closes
-  maxMessagesPerRun: 12,    // protects Worker subrequest limits
+  watchExpiryCandles: 12,         // forming / unfilled setups die after this many candles of their timeframe
+  cooldownMinutes: 60,            // no new signal on a symbol right after its trade closes
+  maxMessagesPerRun: 12,          // protects Worker subrequest limits
+  // Trade plan used for results AND Telegram text. R is tracked as if you follow it.
+  partialSplits: { 1: [1], 2: [0.5, 0.5], 3: [0.5, 0.3, 0.2] },
+  breakevenAfterTp1: true,        // stop moves to entry once TP1 is hit
+  displayTimeZone: "Africa/Nairobi",
   cacheUrl: "https://sky-ai-backend.i96463073.workers.dev/api/prices-cache"
 };
+
+// Worker plans cap outside requests per run (free plan: 50). Rough use:
+// 3 data calls per symbol (M15, H1, H4) + 2 KV + up to 12 Telegram messages.
+if (SYMBOL_LIST.length * 3 + 2 + CONFIG.maxMessagesPerRun > 50) {
+  console.warn(`${SYMBOL_LIST.length} symbols may exceed the 50-subrequest limit on the free plan.`);
+}
 
 // ============================================================
 // SMALL HELPERS
@@ -52,13 +69,19 @@ function confidencePct(raw) {
   return Math.max(0, Math.min(100, Math.round(n <= 1 ? n * 100 : n)));
 }
 
-function confidenceBar(pct) {
-  if (pct === null) return "";
-  const filled = Math.round(pct / 10);
-  return "▰".repeat(filled) + "▱".repeat(10 - filled) + ` ${pct}%`;
+// Time shown to you in East Africa Time
+function eatStamp(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: CONFIG.displayTimeZone, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+    }).formatToParts(d).map((x) => [x.type, x.value])
+  );
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} EAT`;
 }
-
-const utcStamp = (iso) => (iso ? new Date(iso).toISOString().slice(0, 16).replace("T", " ") + " UTC" : "—");
 
 function candleMs(c) {
   const v = c?.time ?? c?.t ?? c?.timestamp ?? c?.datetime ?? c?.date;
@@ -70,15 +93,20 @@ function candleMs(c) {
   return null;
 }
 
-/** High/low/close since `sinceMs`. Candles with unreadable timestamps only contribute their close. */
-function extractRange(candles, sinceMs) {
+/**
+ * High/low/close since `sinceMs`.
+ * strictAfter = true only uses candles that OPENED after sinceMs (used for the breakeven check,
+ * so lows from before TP1 was hit can't trigger a false breakeven exit).
+ */
+function extractRange(candles, sinceMs, strictAfter = false) {
   if (!Array.isArray(candles) || !candles.length) return null;
   const close = toNum(candles[candles.length - 1]?.close);
   if (close === null) return null;
   let high = close, low = close;
   for (const c of candles) {
     const t = candleMs(c);
-    if (t === null || t + CONFIG.candleMs <= sinceMs) continue;
+    if (t === null) continue;
+    if (strictAfter ? t < sinceMs : t + CONFIG.candleMs <= sinceMs) continue;
     const h = toNum(c.high), l = toNum(c.low);
     if (h !== null) high = Math.max(high, h);
     if (l !== null) low = Math.min(low, l);
@@ -95,11 +123,37 @@ function rMultiple(trade, price) {
 
 const signedR = (r) => `${r >= 0 ? "+" : "−"}${Math.abs(r).toFixed(2)}R`;
 
+const splitsFor = (n) => CONFIG.partialSplits[n] ?? Array(n).fill(1 / n);
+
+/** Realized R for the plan: partial closes at each TP; the rest stops at breakeven (or the original stop). */
+function realizedR(trade, tpHit, stoppedOut) {
+  const sp = splitsFor(trade.take_profit.length);
+  let r = 0, closed = 0;
+  for (let i = 0; i < tpHit; i++) {
+    r += sp[i] * rMultiple(trade, trade.take_profit[i]);
+    closed += sp[i];
+  }
+  if (stoppedOut) {
+    const stopR = tpHit >= 1 && CONFIG.breakevenAfterTp1 ? 0 : -1;
+    r += (1 - closed) * stopR;
+  }
+  return r;
+}
+
+const expiryMs = (trade) =>
+  CONFIG.watchExpiryCandles * (CONFIG.tfMs[trade.timeframe] ?? CONFIG.candleMs);
+
+function planText(trade) {
+  const sp = splitsFor(trade.take_profit.length);
+  const parts = sp.map((p, i) => `${Math.round(p * 100)}% TP${i + 1}`);
+  return parts.join(" · ") + (CONFIG.breakevenAfterTp1 ? " · SL to breakeven after TP1" : "");
+}
+
 // ============================================================
 // STATE (KV)
 // ============================================================
 async function loadState(env) {
-  const empty = { pending: [], completed: [], news: [], cooldowns: {} };
+  const empty = { pending: [], completed: [], news: [], cooldowns: {}, tracker: {} };
   try {
     const raw = await env.SKY_MEMORY.get("app_state");
     if (!raw) return { raw: "", state: empty };
@@ -110,7 +164,8 @@ async function loadState(env) {
         pending: Array.isArray(s.pending) ? s.pending : [],
         completed: Array.isArray(s.completed) ? s.completed : [],
         news: Array.isArray(s.news) ? s.news : [],
-        cooldowns: s.cooldowns && typeof s.cooldowns === "object" ? s.cooldowns : {}
+        cooldowns: s.cooldowns && typeof s.cooldowns === "object" ? s.cooldowns : {},
+        tracker: s.tracker && typeof s.tracker === "object" ? s.tracker : {}
       }
     };
   } catch (e) {
@@ -188,7 +243,6 @@ function statusLine(trade) {
 function buildSignalMessage(trade, kind) {
   const buy = trade.direction === "BUY";
   const s = trade.symbol;
-  const pct = trade.confidence_pct;
   const risk = Math.abs(trade.entry - trade.stop_loss);
 
   const header =
@@ -207,13 +261,15 @@ function buildSignalMessage(trade, kind) {
     header,
     "",
     `${buy ? "🟢" : "🔴"} <b>${trade.direction} ${esc(s)}</b> · ${esc(trade.timeframe)}` +
-      (trade.session && trade.session !== "UNKNOWN" ? ` · ${esc(trade.session)} session` : ""),
-    pct !== null ? `📈 Confidence: ${confidenceBar(pct)}` : "",
+      (trade.session && trade.session !== "UNKNOWN" ? ` · ${esc(String(trade.session).replace(/_/g, " "))}` : ""),
+    `🏅 Grade: <b>${esc(trade.quality)}</b>` + (trade.score !== null ? ` · Score ${trade.score}/100` : ""),
+    trade.tier === "RELAXED" ? "⚠️ <b>Lower-confidence (B-grade).</b> Use half your normal risk." : null,
     "━━━━━━━━━━━━━━━━━━",
     `📍 <b>Entry:</b> <code>${fmt(s, trade.entry)}</code>`,
     `🛑 <b>Stop Loss:</b> <code>${fmt(s, trade.stop_loss)}</code>  (−${pipsBetween(s, trade.entry, trade.stop_loss)} pips)`,
     ...tpLines,
     `⚖️ <b>Max R:R:</b> 1:${finalR.toFixed(1)}`,
+    `📋 <b>Plan:</b> ${esc(planText(trade))}`,
     "━━━━━━━━━━━━━━━━━━",
     statusLine(trade)
   ];
@@ -229,8 +285,8 @@ function buildSignalMessage(trade, kind) {
   const bd = renderBreakdown(trade.breakdown);
   if (bd) lines.push("", "📊 <b>Score breakdown:</b>", bd);
 
-  lines.push("", `🕒 ${utcStamp(trade.created_at)}`, "<i>Not financial advice. Manage your risk.</i>");
-  return lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n").trim();
+  lines.push("", `🕒 ${eatStamp(trade.created_at)}`, "<i>Not financial advice. Manage your risk.</i>");
+  return lines.filter((l) => l !== null).filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n").trim();
 }
 
 function buildEntryMessage(trade) {
@@ -244,12 +300,14 @@ function buildEntryMessage(trade) {
 function buildTpHitMessage(trade, tpIndex) {
   const tp = trade.take_profit[tpIndex - 1];
   const remaining = trade.take_profit.length - tpIndex;
+  const be = CONFIG.breakevenAfterTp1 && tpIndex === 1
+    ? `Move your stop to breakeven (<code>${fmt(trade.symbol, trade.entry)}</code>). Results are tracked as if you did.`
+    : "";
   return [
     `🎯 <b>TP${tpIndex} HIT</b> — ${trade.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"} <b>${esc(trade.symbol)}</b> (${esc(trade.timeframe)})`,
     `Price reached <code>${fmt(trade.symbol, tp)}</code> (+${pipsBetween(trade.symbol, tp, trade.entry)} pips · ${signedR(rMultiple(trade, tp))}).`,
-    remaining > 0
-      ? `Still running toward TP${tpIndex + 1}. Consider securing profit / moving SL to breakeven.`
-      : ""
+    remaining > 0 ? `Still running toward TP${tpIndex + 1}.` : "",
+    be
   ].filter(Boolean).join("\n");
 }
 
@@ -257,17 +315,19 @@ function buildClosedMessage(trade, completed) {
   const win = trade.result === "WIN";
   const wins = completed.filter((t) => t.result === "WIN").length;
   const rate = completed.length ? Math.round((wins / completed.length) * 100) : 0;
-  const r = rMultiple(trade, trade.exit_price);
+  const netR = completed.reduce((sum, t) => sum + (toNum(t.r_multiple) ?? 0), 0);
+  const r = trade.r_multiple;
+  const icon = trade.result === "WIN" ? "✅" : trade.result === "LOSS" ? "❌" : "➖";
   return [
-    `${win ? "✅" : "❌"} <b>TRADE CLOSED — ${trade.result}</b>`,
+    `${icon} <b>TRADE CLOSED — ${trade.result}</b>`,
     `${trade.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"} <b>${esc(trade.symbol)}</b> (${esc(trade.timeframe)})`,
     "━━━━━━━━━━━━━━━━━━",
     `Entry: <code>${fmt(trade.symbol, trade.entry)}</code>`,
     `Exit: <code>${fmt(trade.symbol, trade.exit_price)}</code>`,
-    `Result: <b>${signedR(r)}</b> (${r >= 0 ? "+" : "−"}${pipsBetween(trade.symbol, trade.exit_price, trade.entry)} pips)`,
+    `Realized: <b>${signedR(r)}</b> (after partials${CONFIG.breakevenAfterTp1 ? " & breakeven" : ""})`,
     `TPs hit: ${trade.tp_hit}/${trade.take_profit.length}`,
     "━━━━━━━━━━━━━━━━━━",
-    `📊 Last ${completed.length} trades: ${wins}W / ${completed.length - wins}L (${rate}% win rate)`
+    `📊 Last ${completed.length} trades: ${wins}W / ${completed.length - wins}L (${rate}% win rate) · Net ${signedR(netR)}`
   ].join("\n");
 }
 
@@ -313,6 +373,8 @@ function buildTrade(res, symbol, tf) {
     take_profit: tps,
     confidence: sig.confidence ?? sig.score,
     confidence_pct: confidencePct(sig.confidence ?? sig.score),
+    score: toNum(sig.score),
+    tier: sig.tier || res.tier || null,
     quality: sig.quality || "WATCHLIST",
     breakdown: sig.breakdown,
     is_sd: !!sig.is_sd,
@@ -330,7 +392,13 @@ function buildTrade(res, symbol, tf) {
   };
 }
 
-const rank = (t) => (t.watch ? 0 : 1000) + (t.confidence_pct || 0);
+const rank = (t) => (t.watch ? 0 : 1000) + (toNum(t.score) || 0);
+
+const jsonResponse = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+
+// Optional: set an ADMIN_KEY secret to protect the /test-* routes (call them with ?key=...).
+const authorized = (url, env) => !env.ADMIN_KEY || url.searchParams.get("key") === env.ADMIN_KEY;
 
 // ============================================================
 // WORKER
@@ -339,24 +407,33 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) return handleApi(request, env);
+
     if (url.pathname === "/test-signal") {
+      if (!authorized(url, env)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
       const symbol = url.searchParams.get("symbol") || "XAUUSD";
       const timeframe = url.searchParams.get("timeframe") || "M15";
       try {
-        const result = await getSignal(env, symbol, timeframe);
-        return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+        return jsonResponse(await getSignal(env, symbol, timeframe));
       } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: String(e) }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" }
-        });
+        return jsonResponse({ ok: false, error: String(e) }, 500);
       }
     }
+
+    // Dry run of the all-pairs scan (does not save state or send alerts)
+    if (url.pathname === "/test-scan") {
+      if (!authorized(url, env)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
+      try {
+        return jsonResponse(await scanAll(env, { timeframes: CONFIG.timeframes, tracker: new SignalTracker() }));
+      } catch (e) {
+        return jsonResponse({ ok: false, error: String(e) }, 500);
+      }
+    }
+
     return new Response("Sky AI Backend is running.", { status: 200 });
   },
 
   async scheduled(event, env, ctx) {
-    console.log("Cron Job Started: Scanning ALL pairs...");
+    console.log(`Cron Job Started: scanning ${SYMBOL_LIST.length} pairs...`);
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
@@ -364,15 +441,17 @@ export default {
     let completed = state.completed;
     const news = state.news;
     const cooldowns = state.cooldowns;
+    const tracker = new SignalTracker(state.tracker);   // daily count, cooldowns, watch expiry
+    const marketCache = new Map();                      // one data call per symbol/timeframe this run
     const notifications = [];
 
     // ---------- 1. FETCH LIVE PRICES + RECENT CANDLES ----------
     const livePrices = {};
     const candlesBySymbol = {};
     await Promise.all(
-      CONFIG.symbols.map(async (symbol) => {
+      SYMBOL_LIST.map(async (symbol) => {
         try {
-          const md = await getMarketData(env, symbol, "M15", CONFIG.priceCandles);
+          const md = await fetchMarketCached(env, symbol, "M15", DEFAULT_CANDLE_LIMIT, marketCache);
           if (md?.ok && Array.isArray(md.candles) && md.candles.length) {
             const close = toNum(md.candles[md.candles.length - 1].close);
             if (close !== null) {
@@ -390,26 +469,26 @@ export default {
     let active = [];
     for (const trade of state.pending) {
       try {
-        const candles = candlesBySymbol[trade.symbol];
-        const sinceMs = Date.parse(trade.last_checked || trade.created_at) || 0;
-        const rng = candles ? extractRange(candles, sinceMs) : null;
-
         // Malformed trade → drop it quietly rather than crash the run
         if (!trade.symbol || !Array.isArray(trade.take_profit) || !trade.take_profit.length ||
             toNum(trade.entry) === null || toNum(trade.stop_loss) === null) {
           console.error("Dropping malformed trade:", trade?.id);
           continue;
         }
+
+        const candles = candlesBySymbol[trade.symbol];
+        const sinceMs = Date.parse(trade.last_checked || trade.created_at) || 0;
+        const rng = candles ? extractRange(candles, sinceMs) : null;
         if (!rng) { active.push(trade); continue; }
 
         const buy = trade.direction === "BUY";
-        const ageH = (nowMs - (Date.parse(trade.created_at) || nowMs)) / 36e5;
+        const ageMs = nowMs - (Date.parse(trade.created_at) || nowMs);
         const slHit = buy ? rng.low <= trade.stop_loss : rng.high >= trade.stop_loss;
 
         // --- Watchlist (not entered, not tradable yet) ---
         if (trade.watch) {
           if (slHit) { notifications.push(buildCancelMessage(trade, "INVALIDATED")); continue; }
-          if (ageH > CONFIG.watchExpiryHours) { notifications.push(buildCancelMessage(trade, "EXPIRED")); continue; }
+          if (ageMs > expiryMs(trade)) { notifications.push(buildCancelMessage(trade, "EXPIRED")); continue; }
           trade.last_checked = nowIso;
           active.push(trade);
           continue;
@@ -419,7 +498,7 @@ export default {
         if (!trade.entered) {
           const touched = buy ? rng.low <= trade.entry : rng.high >= trade.entry;
           if (!touched) {
-            if (ageH > CONFIG.watchExpiryHours) { notifications.push(buildCancelMessage(trade, "EXPIRED")); continue; }
+            if (ageMs > expiryMs(trade)) { notifications.push(buildCancelMessage(trade, "EXPIRED")); continue; }
             trade.last_checked = nowIso;
             active.push(trade);
             continue;
@@ -428,7 +507,7 @@ export default {
           if (!slHit) notifications.push(buildEntryMessage(trade));
         }
 
-        // --- Live trade: TP / SL (conservative: SL wins if both touched in the same window) ---
+        // --- Live trade: TP / stop (conservative: stop wins if touched in the same window as a new TP) ---
         const tps = trade.take_profit;
         const priorTp = trade.tp_hit || 0;
         let newTp = 0;
@@ -436,25 +515,41 @@ export default {
           if (buy ? rng.high >= tp : rng.low <= tp) newTp = i + 1;
         });
 
-        let result = null, exitPrice = null;
-        if (slHit) {
-          if (priorTp > 0) { result = "WIN"; exitPrice = tps[priorTp - 1]; }
-          else { result = "LOSS"; exitPrice = trade.stop_loss; }
+        // After TP1 the stop sits at breakeven; only look at candles opened after TP1 was recorded.
+        const beActive = CONFIG.breakevenAfterTp1 && priorTp >= 1;
+        let stopHit = slHit;
+        if (beActive) {
+          const beRng = extractRange(candles, Date.parse(trade.be_since) || sinceMs, true);
+          stopHit = beRng ? (buy ? beRng.low <= trade.entry : beRng.high >= trade.entry) : false;
+        }
+
+        let result = null, exitPrice = null, rReal = 0;
+        if (stopHit) {
+          // credit only TPs recorded in earlier runs
+          rReal = realizedR(trade, priorTp, true);
+          exitPrice = beActive ? trade.entry : trade.stop_loss;
+          trade.tp_hit = priorTp;
+          result = rReal >= 0.01 ? "WIN" : rReal <= -0.01 ? "LOSS" : "BREAKEVEN";
         } else {
           trade.tp_hit = Math.max(priorTp, newTp);
-          if (trade.tp_hit >= tps.length) { result = "WIN"; exitPrice = tps[tps.length - 1]; }
+          if (trade.tp_hit >= tps.length) {
+            rReal = realizedR(trade, tps.length, false);
+            exitPrice = tps[tps.length - 1];
+            result = "WIN";
+          }
         }
 
         if (result) {
           trade.result = result;
           trade.exit_price = exitPrice;
           trade.closed_at = nowIso;
-          trade.r_multiple = Number(rMultiple(trade, exitPrice).toFixed(2));
+          trade.r_multiple = Number(rReal.toFixed(2));
           completed.unshift(trade);
           completed = completed.slice(0, CONFIG.maxCompleted);
           cooldowns[trade.symbol] = new Date(nowMs + CONFIG.cooldownMinutes * 60000).toISOString();
           notifications.push(buildClosedMessage(trade, completed));
         } else {
+          if (priorTp === 0 && trade.tp_hit >= 1) trade.be_since = nowIso;
           for (let i = priorTp + 1; i <= trade.tp_hit; i++) notifications.push(buildTpHitMessage(trade, i));
           trade.last_checked = nowIso;
           active.push(trade);
@@ -470,27 +565,36 @@ export default {
       if (!(Date.parse(until) > nowMs)) delete cooldowns[sym];
     }
 
-    // ---------- 3. SCAN FOR NEW SIGNALS / UPGRADE WATCHLIST ----------
-    const lockedSymbols = new Set(active.filter((t) => !t.watch).map((t) => t.symbol.toUpperCase()));
+    // ---------- 3. SCAN ALL PAIRS FOR NEW SIGNALS / UPGRADE WATCHLIST ----------
+    const lockedTrades = active.filter((t) => !t.watch);
+    const lockedSymbols = new Set(lockedTrades.map((t) => t.symbol.toUpperCase()));
+    const eligible = SYMBOL_LIST.filter(
+      (s) => !lockedSymbols.has(s) && !(cooldowns[s] && Date.parse(cooldowns[s]) > nowMs)
+    );
 
-    for (const symbol of CONFIG.symbols) {
-      if (lockedSymbols.has(symbol)) continue; // active trade or pending entry
-      if (cooldowns[symbol] && Date.parse(cooldowns[symbol]) > nowMs) continue;
-
-      let best = null;
-      for (const tf of CONFIG.timeframes) {
-        try {
-          const res = await getSignal(env, symbol, tf, { activeSymbols: [...lockedSymbols] });
-          if (!res?.ok || !res.signal) continue;
-          if (res.status !== "SETUP_FOUND" && res.status !== "SETUP_FORMING") continue;
-          const cand = buildTrade(res, symbol, tf);
-          if (!cand) continue;
-          if (!best || rank(cand) > rank(best)) best = cand;
-          if (!cand.watch) break; // confirmed setup found, skip remaining timeframes
-        } catch (e) {
-          console.error(`Error scanning ${symbol} ${tf}:`, e);
-        }
+    let scan = null;
+    if (eligible.length) {
+      try {
+        scan = await scanAll(env, {
+          symbols: eligible,
+          timeframes: CONFIG.timeframes,
+          tracker,
+          activeSymbols: [...lockedSymbols],
+          openTrades: lockedTrades.map((t) => ({ symbol: t.symbol, direction: t.direction })),
+          marketCache,
+          timestamp: nowMs
+        });
+        if (scan.skipped) console.log("Scan skipped:", scan.skipped);
+        else console.log(`Scan done: ${scan.signals.length} signal(s), ${scan.candidates.length} candidate(s), quota ${scan.quota.count}/${scan.quota.target}`);
+      } catch (e) {
+        console.error("scanAll failed:", e);
       }
+    }
+
+    for (const res of scan?.candidates ?? []) {
+      const symbol = res.symbol;
+      if (!symbol || lockedSymbols.has(symbol)) continue;
+      const best = buildTrade(res, symbol, res.timeframe);
       if (!best) continue;
 
       const existingIdx = active.findIndex((t) => t.watch && t.symbol.toUpperCase() === symbol);
@@ -501,7 +605,7 @@ export default {
           // Same forming setup → silently refresh levels, no spam
           Object.assign(existing, {
             entry: best.entry, stop_loss: best.stop_loss, take_profit: best.take_profit,
-            confidence: best.confidence, confidence_pct: best.confidence_pct,
+            confidence: best.confidence, confidence_pct: best.confidence_pct, score: best.score,
             timeframe: best.timeframe, entryStatus: best.entryStatus,
             confluence: best.confluence, reasons: best.reasons, breakdown: best.breakdown,
             updated_at: nowIso
@@ -527,7 +631,7 @@ export default {
     });
     ctx.waitUntil(cache.put(cacheKey, cacheResponse));
 
-    const newRaw = JSON.stringify({ pending: active, completed, news, cooldowns });
+    const newRaw = JSON.stringify({ pending: active, completed, news, cooldowns, tracker: tracker.snapshot(nowMs) });
     if (newRaw !== oldRaw) {
       try {
         await env.SKY_MEMORY.put("app_state", newRaw);
