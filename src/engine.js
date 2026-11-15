@@ -16,6 +16,7 @@ import { analyze } from "./smc/analyze.js";
 const MAX_ZONE_DISTANCE_ATR = 1.0;
 const MAX_EVENT_AGE = 30;
 const MAX_SWEEP_AGE = 25;
+const RETEST_MAX_AGE = 1;            // an order block first tapped within this many closed candles still counts as a fresh retest
 const MIN_STOP_ATR = 1.5;
 const MAX_STOP_ATR = 3.0;
 const STOP_BUFFER_ATR = 0.2;
@@ -405,7 +406,13 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
 
   const validBlocks = (analysis.orderBlocks ?? [])
     .filter(ob => {
-      if (ob.direction !== trend || ob.status !== "unmitigated") return false;
+      if (ob.direction !== trend) return false;
+      // Fresh = never touched, OR first touched within the last RETEST_MAX_AGE closed candles (the retest we trade).
+      // analyze.js marks a block "mitigated" the moment price trades into it, so demanding "unmitigated"
+      // made a confirmed entry impossible: price inside the zone is, by definition, already mitigated.
+      const touchedAt = ob.status === "mitigated" ? finite(ob.mitigatedIndex) : null;
+      const freshTouch = touchedAt !== null && lastIndex - touchedAt >= 0 && lastIndex - touchedAt <= RETEST_MAX_AGE;
+      if (ob.status !== "unmitigated" && !freshTouch) return false;
       const top = finite(ob.top), bottom = finite(ob.bottom);
       if (top === null || bottom === null || top <= bottom) return false;
       if (trend === "bullish" && price < bottom) return false;
@@ -493,7 +500,10 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   // 9. ENTRY, STOP
   result.candidateZone = { top: blockTop, bottom: blockBottom, orderBlockTime: block.time, status: block.status };
   const insideZone = price >= blockBottom && price <= blockTop;
-  const entry = insideZone ? price : (trend === "bullish" ? blockTop : blockBottom);
+  const retested = block.status === "mitigated";      // first tap just happened (older taps were filtered out above)
+  const atZone = insideZone || retested;
+  if (retested) result.confluence.push("Order block retest");
+  const entry = atZone ? price : (trend === "bullish" ? blockTop : blockBottom);
 
   const buffer = atr * STOP_BUFFER_ATR;
   const structuralSL = trend === "bullish" ? blockBottom - buffer : blockTop + buffer;
@@ -554,7 +564,7 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   result.management = plan.management;
 
   // 11. ENTRY CONFIRMATION
-  if (!insideZone) {
+  if (!atZone) {
     result.watch = true;
     result.entryStatus = "WAITING_FOR_RETEST";
     result.confidenceLabel = "Setup forming";
