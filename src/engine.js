@@ -983,7 +983,10 @@ function decide(ctx, opts = {}) {
 
   setup = tracker.review(setup, { timestamp, candleMs, lastCandle });
 
-  const annotations = buildChartAnnotations(analysis, setup);
+  // The all-pairs scan passes slim:true, so it skips building the big chart payload
+  // (analysis / annotations / candles). Only /api/chart (getSignal) needs those.
+  const full = !opts.slim;
+  const annotations = full ? buildChartAnnotations(analysis, setup) : [];
   const decision = setup.decision ?? "NO_TRADE";
 
   return {
@@ -995,10 +998,10 @@ function decide(ctx, opts = {}) {
     processingMs: Date.now() - startedAt,
     price: currentPrice,
     htf: { timeframe: htf.timeframe, trend: htf.trend },
-    market: marketSummary,
-    analysis: jsonSafe(analysis),
-    setup: jsonSafe(setup),
-    annotations: Array.isArray(annotations) ? jsonSafe(annotations) : [],
+    market: full ? marketSummary : null,
+    analysis: full ? jsonSafe(analysis) : null,
+    setup: full ? jsonSafe(setup) : null,
+    annotations: full && Array.isArray(annotations) ? jsonSafe(annotations) : [],
     signal: {
       decision, direction: setup.direction ?? null, watch: Boolean(setup.watch),
       tier: setup.tier ?? null, quality: setup.quality ?? null,
@@ -1119,7 +1122,7 @@ export async function scanAll(env, options = {}) {
   }
 
   const all = [];   // { ctx, result, mode }
-  const base = { tracker, activeSymbols, exposure, account: options.account, htfLevels: options.htfLevels, timestamp: nowTs };
+  const base = { tracker, activeSymbols, exposure, account: options.account, htfLevels: options.htfLevels, timestamp: nowTs, slim: true };
   const accept = result => {
     result.signal.daily_count = tracker.quota(nowTs).count;
     out.signals.push(result);
