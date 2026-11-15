@@ -7,6 +7,7 @@ import {
   fetchMarketCached,
   DEFAULT_CANDLE_LIMIT
 } from "./engine.js";
+import { handleChat, getCalendar, newsCheck, upcomingNews } from "./agent.js";
 
 // ============================================================
 // CONFIG
@@ -24,6 +25,8 @@ const CONFIG = {
   // Trade plan used for results AND Telegram text. R is tracked as if you follow it.
   partialSplits: { 1: [1], 2: [0.5, 0.5], 3: [0.5, 0.3, 0.2] },
   breakevenAfterTp1: true,        // stop moves to entry once TP1 is hit
+  newsBeforeMin: 30,              // no new signals this long BEFORE a high-impact news event for the pair's currencies
+  newsAfterMin: 30,               // ...and this long AFTER it
   displayTimeZone: "Africa/Nairobi",
   cacheUrl: "https://sky-ai-backend.i96463073.workers.dev/api/prices-cache"
 };
@@ -429,6 +432,22 @@ export default {
       }
     }
 
+    // App chat tab (AI assistant that knows your live signals)
+    if (url.pathname === "/chat") return handleChat(request, env);
+
+    // Shows whether the news calendar works and which pairs are blocked right now
+    if (url.pathname === "/test-news") {
+      if (!authorized(url, env)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
+      const cal = await getCalendar(env);
+      const now = Date.now();
+      const blocked = {};
+      for (const s of SYMBOL_LIST) {
+        const n = newsCheck(cal.events, s, now, { beforeMin: CONFIG.newsBeforeMin, afterMin: CONFIG.newsAfterMin });
+        if (n.block) blocked[s] = n.reason;
+      }
+      return jsonResponse({ ok: true, source: cal.source, events: cal.events.length, blocked, upcoming: upcomingNews(cal.events, now, 24, 8) });
+    }
+
     return new Response("Sky AI Backend is running.", { status: 200 });
   },
 
@@ -439,7 +458,7 @@ export default {
 
     const { raw: oldRaw, state } = await loadState(env);
     let completed = state.completed;
-    const news = state.news;
+    let news = state.news;
     const cooldowns = state.cooldowns;
     const tracker = new SignalTracker(state.tracker);   // daily count, cooldowns, watch expiry
     const marketCache = new Map();                      // one data call per symbol/timeframe this run
@@ -565,11 +584,29 @@ export default {
       if (!(Date.parse(until) > nowMs)) delete cooldowns[sym];
     }
 
+    // ---------- 2b. NEWS FILTER (economic calendar; cached in KV) ----------
+    const newsBlocked = {};
+    try {
+      const cal = await getCalendar(env);
+      if (cal.events.length) {
+        for (const s of SYMBOL_LIST) {
+          const n = newsCheck(cal.events, s, nowMs, { beforeMin: CONFIG.newsBeforeMin, afterMin: CONFIG.newsAfterMin });
+          if (n.block) newsBlocked[s] = n.reason;
+        }
+        news = upcomingNews(cal.events, nowMs, 24, 8);   // shown in the app's news list
+      } else {
+        console.warn(`News calendar unavailable (${cal.source}); signals are NOT being blocked for news.`);
+      }
+    } catch (e) {
+      console.error("News filter failed:", e);
+    }
+    if (Object.keys(newsBlocked).length) console.log("News block:", JSON.stringify(newsBlocked));
+
     // ---------- 3. SCAN ALL PAIRS FOR NEW SIGNALS / UPGRADE WATCHLIST ----------
     const lockedTrades = active.filter((t) => !t.watch);
     const lockedSymbols = new Set(lockedTrades.map((t) => t.symbol.toUpperCase()));
     const eligible = SYMBOL_LIST.filter(
-      (s) => !lockedSymbols.has(s) && !(cooldowns[s] && Date.parse(cooldowns[s]) > nowMs)
+      (s) => !lockedSymbols.has(s) && !newsBlocked[s] && !(cooldowns[s] && Date.parse(cooldowns[s]) > nowMs)
     );
 
     let scan = null;
