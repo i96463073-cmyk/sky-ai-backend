@@ -791,6 +791,13 @@ async function mapPool(items, limit, fn) {
   return out;
 }
 
+// Biquote errors are objects {code, message}; turn them into text so reasons never show "[object Object]".
+function errText(e, fallback) {
+  if (!e) return fallback;
+  if (typeof e === "string") return e;
+  return [e.code, e.message].filter(Boolean).join(": ") || fallback;
+}
+
 // One market-data request per symbol/timeframe per run (saves Worker subrequests).
 // Pass the same Map to every call in a run (index.js shares it with scanAll).
 export function fetchMarketCached(env, symbol, tf, limit, cache) {
@@ -836,7 +843,7 @@ async function loadHtfTrend(env, symbolKey, tfKey, cache, marketCache) {
   const job = (async () => {
     try {
       const m = await fetchMarketCached(env, symbolKey, htfKey, HTF_CANDLE_LIMIT, marketCache);
-      if (!m || m.ok !== true) return { timeframe: htfKey, trend: null, error: m?.error || `${htfKey} data unavailable.` };
+      if (!m || m.ok !== true) return { timeframe: htfKey, trend: null, error: errText(m?.error, `${htfKey} data unavailable.`) };
       const closed = getClosedCandles(m.candles);
       if (closed.length < MIN_CLOSED_CANDLES) return { timeframe: htfKey, trend: null, error: `Not enough ${htfKey} candles.` };
       const a = analyze(closed, htfKey);
@@ -866,12 +873,12 @@ async function prepare(env, symbolKey, tfKey, options = {}) {
   try {
     const market = await fetchMarketCached(env, symbolKey, tfKey, limit, options.marketCache);
     if (!market || market.ok !== true) {
-      return fail(market?.error || "Market data provider returned no valid data.", { provider: market?.provider ?? "unknown" });
+      return fail(errText(market?.error, "Market data provider returned no valid data."), { provider: market?.provider ?? "unknown" });
     }
 
     const closedCandles = getClosedCandles(market.candles);
     const quality = getQuality(market, closedCandles);
-    const freshness = assessFreshness(closedCandles, tfKey, Date.now());
+    const freshness = assessFreshness(Array.isArray(market.candles) && market.candles.length ? market.candles : closedCandles, tfKey, Date.now());
     const chartCandles = closedCandles.map(summarizeCandle);
 
     const marketSummary = {
@@ -955,6 +962,13 @@ function decide(ctx, opts = {}) {
   });
   if (!setup || typeof setup !== "object") {
     return buildErrorResult({ symbol: symbolKey, timeframe: tfKey, message: "Setup evaluator returned no valid result.", startedAt });
+  }
+
+  // never act on stale data (provider outage / lagging feed)
+  if (marketSummary?.freshness?.status === "stale" && (setup.decision === "BUY" || setup.decision === "SELL" || setup.watch)) {
+    setup.decision = "NO_TRADE"; setup.watch = false; setup.entryStatus = "NOT_CONFIRMED";
+    setup.confidenceLabel = "Insufficient evidence";
+    setup.reasons.push("Blocked: market data is stale (the newest candle is too old).");
   }
 
   // currency exposure cap (runs before the tracker counts the signal)
