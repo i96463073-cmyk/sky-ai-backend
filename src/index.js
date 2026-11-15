@@ -156,7 +156,7 @@ function planText(trade) {
 // STATE (KV)
 // ============================================================
 async function loadState(env) {
-  const empty = { pending: [], completed: [], news: [], cooldowns: {}, tracker: {} };
+  const empty = { pending: [], completed: [], news: [], cooldowns: {}, tracker: {}, lastScanCandle: 0 };
   try {
     const raw = await env.SKY_MEMORY.get("app_state");
     if (!raw) return { raw: "", state: empty };
@@ -168,7 +168,8 @@ async function loadState(env) {
         completed: Array.isArray(s.completed) ? s.completed : [],
         news: Array.isArray(s.news) ? s.news : [],
         cooldowns: s.cooldowns && typeof s.cooldowns === "object" ? s.cooldowns : {},
-        tracker: s.tracker && typeof s.tracker === "object" ? s.tracker : {}
+        tracker: s.tracker && typeof s.tracker === "object" ? s.tracker : {},
+        lastScanCandle: Number(s.lastScanCandle) || 0
       }
     };
   } catch (e) {
@@ -484,6 +485,16 @@ export default {
       })
     );
 
+    // The engine only reads CLOSED candles, so a scan can only find something new when a new
+    // candle has appeared. Trades are still checked every run; scanning happens once per candle.
+    let newestCandle = 0;
+    for (const cs of Object.values(candlesBySymbol)) {
+      const t = candleMs(cs[cs.length - 1]);
+      if (t !== null && t > newestCandle) newestCandle = t;
+    }
+    const shouldScan = newestCandle > state.lastScanCandle;
+    if (!shouldScan) console.log("No new candle since last scan; managing trades only.");
+
     // ---------- 2. MANAGE EXISTING TRADES / WATCHLIST ----------
     let active = [];
     for (const trade of state.pending) {
@@ -586,7 +597,7 @@ export default {
 
     // ---------- 2b. NEWS FILTER (economic calendar; cached in KV) ----------
     const newsBlocked = {};
-    try {
+    if (shouldScan) try {
       const cal = await getCalendar(env);
       if (cal.events.length) {
         for (const s of SYMBOL_LIST) {
@@ -610,7 +621,8 @@ export default {
     );
 
     let scan = null;
-    if (eligible.length) {
+    let scanFailed = false;
+    if (shouldScan && eligible.length) {
       try {
         scan = await scanAll(env, {
           symbols: eligible,
@@ -625,6 +637,7 @@ export default {
         else console.log(`Scan done: ${scan.signals.length} signal(s), ${scan.candidates.length} candidate(s), quota ${scan.quota.count}/${scan.quota.target}`);
       } catch (e) {
         console.error("scanAll failed:", e);
+        scanFailed = true;   // try again on the next run
       }
     }
 
@@ -668,7 +681,8 @@ export default {
     });
     ctx.waitUntil(cache.put(cacheKey, cacheResponse));
 
-    const newRaw = JSON.stringify({ pending: active, completed, news, cooldowns, tracker: tracker.snapshot(nowMs) });
+    const lastScanCandle = shouldScan && !scanFailed ? newestCandle : state.lastScanCandle;
+    const newRaw = JSON.stringify({ pending: active, completed, news, cooldowns, tracker: tracker.snapshot(nowMs), lastScanCandle });
     if (newRaw !== oldRaw) {
       try {
         await env.SKY_MEMORY.put("app_state", newRaw);
