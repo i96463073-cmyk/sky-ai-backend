@@ -13,15 +13,14 @@ import { analyze } from "./smc/analyze.js";
 // ######################################################
 // PART 1: DECISION ENGINE
 // ######################################################
-const MAX_ZONE_DISTANCE_ATR = 1.0;
 const MAX_EVENT_AGE = 30;
 const MAX_SWEEP_AGE = 25;
-const RETEST_MAX_AGE = 1;            // an order block first tapped within this many closed candles still counts as a fresh retest
 const MIN_STOP_ATR = 1.5;
 const MAX_STOP_ATR = 3.0;
 const STOP_BUFFER_ATR = 0.2;
 const TP_R_MULTIPLES = [2, 3, 4];
 const MIN_TP1_R = 1.5;               // after capping by obstacles, TP1 must still be >= 1.5R
+const USE_PREVIOUS_LEVELS = true;    // cap targets at the previous day/week high (buys) or low (sells)
 const TARGET_BUFFER_ATR = 0.1;       // stop TPs slightly before an obstacle
 
 // Daily quota
@@ -40,11 +39,13 @@ const REJECTION_WICK_RATIO = 0.5;    // wick must be >= 50% of the candle range
 const PROFILES = {
   strict: {
     minScore: 95, killzonesOnly: true, requireSweep: true, requireSequence: true,
-    rejectOnOpposingZone: true, minBodyATR: 0.5, strongConfirm: true, riskScale: 1
+    rejectOnOpposingZone: true, minBodyATR: 0.5, strongConfirm: true, riskScale: 1,
+    retestMaxAge: 1, maxZoneAtr: 1.0
   },
   relaxed: {
     minScore: 75, killzonesOnly: false, requireSweep: false, requireSequence: false,
-    rejectOnOpposingZone: false, minBodyATR: 0.3, strongConfirm: false, riskScale: 0.5
+    rejectOnOpposingZone: false, minBodyATR: 0.3, strongConfirm: false, riskScale: 0.5,
+    retestMaxAge: 3, maxZoneAtr: 1.5
   }
 };
 
@@ -213,15 +214,15 @@ export function getTradingSession(timestamp = Date.now()) {
 // SEQUENCE CHECK: sweep -> structure break -> order block from that move
 // ======================================================
 function findSequence(events, sweeps, blocks) {
-  for (const sweep of sweeps) {
-    for (const event of events) {
-      if (event.index < sweep.index) continue;           // BOS/CHoCH must come after the sweep
-      const block = blocks.find(b => {
-        const ci = finite(b.candleIndex);
-        return ci !== null && ci >= sweep.index;         // OB formed at/after the sweep
-      });
-      if (block) return { sweep, event, block };
-    }
+  for (const block of blocks) {                         // nearest block first
+    // the BOS/CHOCH that created this block (orderblocks.js stores it as confirmIndex)
+    const event = events.find(e => e.index === finite(block.confirmIndex));
+    if (!event) continue;
+    // the sweep must come BEFORE the displacement candle that formed the block (it may be that same candle)
+    const di = finite(block.displacementIndex) ?? finite(block.candleIndex);
+    if (di === null) continue;
+    const sweep = sweeps.find(sw => sw.index <= di && sw.index <= event.index);   // sweeps are sorted newest first
+    if (sweep) return { sweep, event, block };
   }
   return null;
 }
@@ -250,8 +251,19 @@ function collectObstacles(analysis, trend, entry, options) {
     push(zones, price, typeof lvl === "object" && lvl.label ? lvl.label : "HTF level");
   }
   for (const pool of analysis.liquidityPools ?? []) {
-    if (pool.status === "swept") continue;
-    push(liquidity, pool.price ?? pool.level, "Liquidity pool");
+    // Only untouched EQUAL highs/lows act as targets. Ordinary swing highs/lows are skipped: after a break of
+    // structure there is nearly always one just above the order block, and capping there would reject most setups.
+    if (pool.kind !== "equal" || pool.status !== "unswept") continue;
+    push(liquidity, pool.level ?? pool.price, trend === "bullish" ? "Equal highs" : "Equal lows");
+  }
+  // Previous day / week extremes act as liquidity targets: cap TPs there, but never reject on them alone.
+  // Only levels whose full period is inside the loaded candles are used (complete === true).
+  const lv = analysis.levels;
+  if (USE_PREVIOUS_LEVELS && lv?.available) {
+    for (const [name, o] of [["Previous day", lv.previousDay], ["Previous week", lv.previousWeek]]) {
+      if (!o || o.complete !== true) continue;
+      push(liquidity, trend === "bullish" ? o.high : o.low, `${name} ${trend === "bullish" ? "high" : "low"}`);
+    }
   }
   const byDistance = (a, b) => a.distance - b.distance;
   return { zones: zones.sort(byDistance), liquidity: liquidity.sort(byDistance) };
@@ -407,17 +419,17 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   const validBlocks = (analysis.orderBlocks ?? [])
     .filter(ob => {
       if (ob.direction !== trend) return false;
-      // Fresh = never touched, OR first touched within the last RETEST_MAX_AGE closed candles (the retest we trade).
+      // Fresh = never touched, OR first touched within the last P.retestMaxAge closed candles (the retest we trade).
       // analyze.js marks a block "mitigated" the moment price trades into it, so demanding "unmitigated"
       // made a confirmed entry impossible: price inside the zone is, by definition, already mitigated.
       const touchedAt = ob.status === "mitigated" ? finite(ob.mitigatedIndex) : null;
-      const freshTouch = touchedAt !== null && lastIndex - touchedAt >= 0 && lastIndex - touchedAt <= RETEST_MAX_AGE;
+      const freshTouch = touchedAt !== null && lastIndex - touchedAt >= 0 && lastIndex - touchedAt <= P.retestMaxAge;
       if (ob.status !== "unmitigated" && !freshTouch) return false;
       const top = finite(ob.top), bottom = finite(ob.bottom);
       if (top === null || bottom === null || top <= bottom) return false;
       if (trend === "bullish" && price < bottom) return false;
       if (trend === "bearish" && price > top) return false;
-      return getDistance(price, top, bottom) <= atr * MAX_ZONE_DISTANCE_ATR;
+      return getDistance(price, top, bottom) <= atr * P.maxZoneAtr;
     })
     .sort((a, b) =>
       getDistance(price, Number(a.top), Number(a.bottom)) - getDistance(price, Number(b.top), Number(b.bottom)));
@@ -427,7 +439,9 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   }
 
   // 4. SEQUENCE: sweep -> BOS/CHoCH -> order block
-  let event = recentEvents[0], sweep = recentSweeps[0] ?? null, block = validBlocks[0];
+  let block = validBlocks[0];
+  let event = recentEvents.find(e => e.index === finite(block.confirmIndex)) ?? recentEvents[0];
+  let sweep = recentSweeps[0] ?? null;
   if (P.requireSequence) {
     const seq = findSequence(recentEvents, recentSweeps, validBlocks);
     if (!seq) {
@@ -451,21 +465,32 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   result.confluence.push("Order Block");
   result.setupKey = `${options.symbol ?? "?"}:${options.timeframe ?? "?"}:${result.direction}:${block.time ?? block.candleIndex ?? `${blockBottom}-${blockTop}`}`;
 
-  // 5. FVG (bonus)
+  // 5. FVG (bonus): a same-direction gap formed in the SAME move as the order block.
+  // The gap usually sits at the block's edge, so the retest fills it; a gap filled by the current retest still counts.
+  const obStart = finite(block.candleIndex);
+  const obMoveEnd = (finite(block.confirmIndex) ?? lastIndex) + 2;
   const relevantFvg = (analysis.fvg ?? []).find(fvg => {
     if (fvg.direction !== trend) return false;
-    if (!["unmitigated", "partially_mitigated"].includes(fvg.status)) return false;
-    const top = finite(fvg.top), bottom = finite(fvg.bottom);
-    if (top === null || bottom === null) return false;
-    return price >= bottom - atr && price <= top + atr;
+    const fi = finite(fvg.index);
+    if (fi === null || obStart === null || fi < obStart || fi > obMoveEnd) return false;
+    if (fvg.status === "filled") {
+      const filledAt = finite(fvg.mitigatedIndex);
+      return filledAt !== null && lastIndex - filledAt >= 0 && lastIndex - filledAt <= P.retestMaxAge;
+    }
+    return true;
   });
   if (relevantFvg) { obScore += 5; result.confluence.push("Fair Value Gap"); }
   scores.fvg_ob = obScore;
 
   // 6. SUPPLY & DEMAND (bonus)
+  const swingPoolStatus = new Map();   // swings carry no "unmitigated" flag; use their liquidity pool instead
+  for (const pool of analysis.liquidityPools ?? []) {
+    if (pool.kind === "swing" && finite(pool.swingIndex) !== null) swingPoolStatus.set(pool.swingIndex, pool.status);
+  }
   const validSD = (analysis.swings ?? []).slice(-5).find(sw => {
     const swingPrice = finite(sw.price);
-    if (swingPrice === null || !sw.unmitigated) return false;
+    if (swingPrice === null) return false;
+    if (!(sw.unmitigated === true || swingPoolStatus.get(sw.index) === "unswept")) return false;
     if (trend === "bullish" && sw.type === "low") return Math.abs(price - swingPrice) <= atr;
     if (trend === "bearish" && sw.type === "high") return Math.abs(price - swingPrice) <= atr;
     return false;
@@ -480,7 +505,7 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   const range = analysis.dealingRange;
   const equilibrium = finite(range?.equilibrium);
   if (!range?.valid || equilibrium === null) {
-    result.reasons.push("Rejected: no valid dealing range for premium/discount check.");
+    result.reasons.push(`Rejected: no valid dealing range (${range?.reason ?? "unavailable"}).`);
     return result;
   }
   if ((trend === "bullish" && price > equilibrium) || (trend === "bearish" && price < equilibrium)) {
@@ -720,7 +745,7 @@ export function evaluateWithQuota(analysis, currentPrice, options = {}, tracker 
 // ######################################################
 // PART 2: DATA, ANALYSIS AND ALL-PAIRS SCANNER
 // ######################################################
-export const ENGINE_VERSION = "3.1.0";
+export const ENGINE_VERSION = "3.2.0";
 export const DEFAULT_CANDLE_LIMIT = 300;
 const MIN_CLOSED_CANDLES = 30;
 const HTF_CANDLE_LIMIT = DEFAULT_CANDLE_LIMIT;   // same limit so higher-timeframe data is shared
