@@ -7,7 +7,8 @@ import {
   fetchMarketCached,
   DEFAULT_CANDLE_LIMIT
 } from "./engine.js";
-import { handleChat, getCalendar, newsCheck, upcomingNews } from "./agent.js";
+import { getCalendar, newsCheck, upcomingNews } from "./agent.js";
+import { handleBrainChat } from "./brain.js";
 
 // ============================================================
 // CONFIG
@@ -156,7 +157,7 @@ function planText(trade) {
 // STATE (KV)
 // ============================================================
 async function loadState(env) {
-  const empty = { pending: [], completed: [], news: [], cooldowns: {}, tracker: {}, lastScanCandle: 0 };
+  const empty = { pending: [], completed: [], news: [], cooldowns: {}, tracker: {}, lastScanCandle: 0, lastScan: null };
   try {
     const raw = await env.SKY_MEMORY.get("app_state");
     if (!raw) return { raw: "", state: empty };
@@ -169,7 +170,8 @@ async function loadState(env) {
         news: Array.isArray(s.news) ? s.news : [],
         cooldowns: s.cooldowns && typeof s.cooldowns === "object" ? s.cooldowns : {},
         tracker: s.tracker && typeof s.tracker === "object" ? s.tracker : {},
-        lastScanCandle: Number(s.lastScanCandle) || 0
+        lastScanCandle: Number(s.lastScanCandle) || 0,
+        lastScan: s.lastScan && typeof s.lastScan === "object" ? s.lastScan : null
       }
     };
   } catch (e) {
@@ -434,7 +436,7 @@ export default {
     }
 
     // App chat tab (AI assistant that knows your live signals)
-    if (url.pathname === "/chat") return handleChat(request, env);
+    if (url.pathname === "/chat") return handleBrainChat(request, env);
 
     // Shows whether the news calendar works and which pairs are blocked right now
     if (url.pathname === "/test-news") {
@@ -641,6 +643,24 @@ export default {
       }
     }
 
+    // remember what the scan concluded for every pair (the chat brain explains "why no signal" from this)
+    let lastScan = state.lastScan;
+    if (scan && !scanFailed) {
+      const prev = state.lastScan?.summary ?? {};
+      const summary = {};
+      for (const s of SYMBOL_LIST) {
+        if (scan.summary?.[s]) summary[s] = { ...scan.summary[s], at: nowIso };
+        else if (lockedSymbols.has(s)) summary[s] = { status: "LOCKED", reason: "already has an open trade", at: nowIso };
+        else if (cooldowns[s] && Date.parse(cooldowns[s]) > nowMs) summary[s] = { status: "COOLDOWN", reason: "resting after a closed trade", at: nowIso };
+        else if (newsBlocked[s]) summary[s] = { status: "NEWS", reason: newsBlocked[s], at: nowIso };
+        else if (prev[s]) summary[s] = prev[s];
+      }
+      lastScan = {
+        at: nowIso, session: scan.session, skipped: scan.skipped ?? null, quota: scan.quota ?? null,
+        summary, errors: (scan.errors ?? []).length
+      };
+    }
+
     for (const res of scan?.candidates ?? []) {
       const symbol = res.symbol;
       if (!symbol || lockedSymbols.has(symbol)) continue;
@@ -682,7 +702,7 @@ export default {
     ctx.waitUntil(cache.put(cacheKey, cacheResponse));
 
     const lastScanCandle = shouldScan && !scanFailed ? newestCandle : state.lastScanCandle;
-    const newRaw = JSON.stringify({ pending: active, completed, news, cooldowns, tracker: tracker.snapshot(nowMs), lastScanCandle });
+    const newRaw = JSON.stringify({ pending: active, completed, news, cooldowns, tracker: tracker.snapshot(nowMs), lastScanCandle, lastScan });
     if (newRaw !== oldRaw) {
       try {
         await env.SKY_MEMORY.put("app_state", newRaw);
