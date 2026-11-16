@@ -745,7 +745,7 @@ export function evaluateWithQuota(analysis, currentPrice, options = {}, tracker 
 // ######################################################
 // PART 2: DATA, ANALYSIS AND ALL-PAIRS SCANNER
 // ######################################################
-export const ENGINE_VERSION = "3.2.0";
+export const ENGINE_VERSION = "3.3.0";
 export const DEFAULT_CANDLE_LIMIT = 300;
 const MIN_CLOSED_CANDLES = 30;
 const HTF_CANDLE_LIMIT = DEFAULT_CANDLE_LIMIT;   // same limit so higher-timeframe data is shared
@@ -1109,7 +1109,7 @@ export async function scanAll(env, options = {}) {
   const out = {
     ok: true, engineVersion: ENGINE_VERSION, session, strictSession, relaxedActive,
     scanned: { symbols: symbols.length, timeframes, combos: symbols.length * timeframes.length },
-    quota: q0, signals: [], candidates: [], prices: {}, rejections: {}, errors: [], skipped: null
+    quota: q0, signals: [], candidates: [], prices: {}, rejections: {}, errors: [], skipped: null, summary: {}
   };
   if (!strictSession && !relaxedActive) {
     out.skipped = `Session ${session}: strict tier needs London/NY open; relaxed tier is ${q0.met ? "not needed (quota met)" : "locked"}.`;
@@ -1197,6 +1197,25 @@ export async function scanAll(env, options = {}) {
     const cur = best.get(result.symbol);
     if (!cur || rank(result) > rank(cur)) best.set(result.symbol, result);
   }
+
+  // one-line verdict per pair (the Sky brain reads this to answer "why no signal on X?")
+  const info = r => (r.status === "SETUP_FOUND" ? 3 : r.status === "SETUP_FORMING" ? 2 : r.status === "NO_TRADE" ? 1 : 0);
+  const tfRank = tf => { const i = timeframes.indexOf(tf); return i < 0 ? 99 : i; };
+  for (const { ctx, result, mode } of all) {
+    const sym = result.symbol;
+    if (!sym || !result.signal) continue;
+    const cur = out.summary[sym];
+    if (cur && (info(result) < cur._i || (info(result) === cur._i && tfRank(result.timeframe) >= cur._p))) continue;
+    out.summary[sym] = {
+      timeframe: result.timeframe, mode, status: result.status, direction: result.signal.direction ?? null,
+      score: result.signal.score ?? null, quality: result.signal.quality ?? null,
+      reason: result.signal.reasons?.at(-1) ?? null,
+      trend: ctx.analysis?.trend ?? null, htf: ctx.htf?.trend ?? null,
+      zone: ctx.analysis?.dealingRange?.zone ?? null, price: ctx.chartCandles?.at(-1)?.close ?? null,
+      _i: info(result), _p: tfRank(result.timeframe)
+    };
+  }
+  for (const v of Object.values(out.summary)) { delete v._i; delete v._p; }
 
   // which gate rejects most (tune constants with this)
   const mainMode = strictSession ? "strict" : "relaxed";
