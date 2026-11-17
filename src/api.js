@@ -2,8 +2,9 @@ import { SYMBOLS, TIMEFRAMES } from "./market/symbols.js";
 import { getMarketData, assessFreshness, isMarketClosed } from "./market/biquote.js";
 import { analyze } from "./smc/analyze.js";
 import { ENGINE_VERSION, getClosedCandles, getSignal } from "./engine.js";
+import { loadMemory, exportBrain } from "./memory.js";
 
-export const API_VERSION = "signals-api-0.5.0";
+export const API_VERSION = "signals-api-0.6.0";
 
 // "Signals today" counter. Must match the engine's daily target and day boundary (EAT).
 const DAILY_TARGET = 3;
@@ -178,6 +179,12 @@ export async function handleApi(request, env = {}) {
     } catch (e) {
       return fail(500, "CHART_FAIL", String(e?.message || e));
     }
+  }
+
+  // Read-only snapshot of what the brain has learned. The app saves a copy on the phone.
+  if (url.pathname === "/api/brain") {
+    if (!env.SKY_MEMORY) return fail(500, "NO_DB", "Database not configured");
+    return reply(exportBrain(await loadMemory(env)));
   }
 
   if (url.pathname === "/api/analysis") {
