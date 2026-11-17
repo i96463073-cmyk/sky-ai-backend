@@ -9,6 +9,7 @@ import {
 } from "./engine.js";
 import { getCalendar, newsCheck, upcomingNews } from "./agent.js";
 import { handleBrainChat } from "./brain.js";
+import { loadMemory, saveMemory, learnFromTrades, runResearch } from "./memory.js";
 
 // ============================================================
 // CONFIG
@@ -398,6 +399,21 @@ function buildTrade(res, symbol, tf) {
   };
 }
 
+// Hourly job on its own cron (see wrangler.toml): pulls news headlines and catches the brain up on results.
+const RESEARCH_CRON = "7 * * * *";
+async function researchJob(env) {
+  try {
+    const mem = await loadMemory(env);
+    const res = await runResearch(env, mem);
+    const { state } = await loadState(env);
+    const learned = learnFromTrades(mem, state.completed);
+    if (!res.skipped || learned) await saveMemory(env, mem);
+    console.log(`Research job: ${res.skipped ? "skipped (recent)" : res.ok ? res.headlines + " headlines" : "failed: " + (res.errors || []).join("; ")}, learned from ${learned} trade(s)`);
+  } catch (e) {
+    console.error("Research job failed:", e);
+  }
+}
+
 const rank = (t) => (t.watch ? 0 : 1000) + (toNum(t.score) || 0);
 
 const jsonResponse = (obj, status = 200) =>
@@ -455,6 +471,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    if (event && event.cron === RESEARCH_CRON) { await researchJob(env); return; }
     console.log(`Cron Job Started: scanning ${SYMBOL_LIST.length} pairs...`);
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -466,6 +483,7 @@ export default {
     const tracker = new SignalTracker(state.tracker);   // daily count, cooldowns, watch expiry
     const marketCache = new Map();                      // one data call per symbol/timeframe this run
     const notifications = [];
+    const closedNow = [];   // trades that closed this run (the brain learns from them)
 
     // ---------- 1. FETCH LIVE PRICES + RECENT CANDLES ----------
     const livePrices = {};
@@ -577,6 +595,7 @@ export default {
           trade.closed_at = nowIso;
           trade.r_multiple = Number(rReal.toFixed(2));
           completed.unshift(trade);
+          closedNow.push(trade);
           completed = completed.slice(0, CONFIG.maxCompleted);
           cooldowns[trade.symbol] = new Date(nowMs + CONFIG.cooldownMinutes * 60000).toISOString();
           notifications.push(buildClosedMessage(trade, completed));
@@ -618,8 +637,12 @@ export default {
     // ---------- 3. SCAN ALL PAIRS FOR NEW SIGNALS / UPGRADE WATCHLIST ----------
     const lockedTrades = active.filter((t) => !t.watch);
     const lockedSymbols = new Set(lockedTrades.map((t) => t.symbol.toUpperCase()));
+    let paused = new Set();   // pairs you paused in chat
+    if (shouldScan) {
+      try { paused = new Set(Object.keys((await loadMemory(env)).pauses || {})); } catch (_) { /* optional */ }
+    }
     const eligible = SYMBOL_LIST.filter(
-      (s) => !lockedSymbols.has(s) && !newsBlocked[s] && !(cooldowns[s] && Date.parse(cooldowns[s]) > nowMs)
+      (s) => !lockedSymbols.has(s) && !newsBlocked[s] && !paused.has(s) && !(cooldowns[s] && Date.parse(cooldowns[s]) > nowMs)
     );
 
     let scan = null;
@@ -652,6 +675,7 @@ export default {
         if (scan.summary?.[s]) summary[s] = { ...scan.summary[s], at: nowIso };
         else if (lockedSymbols.has(s)) summary[s] = { status: "LOCKED", reason: "already has an open trade", at: nowIso };
         else if (cooldowns[s] && Date.parse(cooldowns[s]) > nowMs) summary[s] = { status: "COOLDOWN", reason: "resting after a closed trade", at: nowIso };
+        else if (paused.has(s)) summary[s] = { status: "PAUSED", reason: "paused by you", at: nowIso };
         else if (newsBlocked[s]) summary[s] = { status: "NEWS", reason: newsBlocked[s], at: nowIso };
         else if (prev[s]) summary[s] = prev[s];
       }
@@ -709,6 +733,16 @@ export default {
       } catch (e) {
         console.error("Failed to save app_state:", e);
         return; // don't send alerts for state we couldn't persist
+      }
+    }
+
+    // ---------- 4b. THE BRAIN LEARNS FROM TRADES THAT JUST CLOSED ----------
+    if (closedNow.length) {
+      try {
+        const mem = await loadMemory(env);
+        if (learnFromTrades(mem, closedNow)) await saveMemory(env, mem);
+      } catch (e) {
+        console.error("Brain learning failed:", e);
       }
     }
 
