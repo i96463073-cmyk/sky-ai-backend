@@ -7,7 +7,11 @@
 // ============================================================
 import { SYMBOLS } from "./market/symbols.js";
 import { getSignal } from "./engine.js";
-import { getCalendar, newsCheck, upcomingNews } from "./agent.js";
+import { getCalendar, newsCheck, upcomingNews, symbolCurrencies } from "./agent.js";
+import {
+  loadMemory, saveMemory, insights, pairBias, addNote, addQa, removeKnowledge, searchKnowledge,
+  pausePair, resumePair, runResearch, headlinesFor, toneFor
+} from "./memory.js";
 
 const TZ = "Africa/Nairobi";
 const DAILY_TARGET = 3;
@@ -100,9 +104,10 @@ const signedR = (r) => `${r >= 0 ? "+" : "−"}${Math.abs(r).toFixed(2)}R`;
 async function readState(env) {
   try { return JSON.parse((await env.SKY_MEMORY.get("app_state")) || "{}") || {}; } catch (_) { return {}; }
 }
-async function getCtx(env) {
+async function getCtx(env, preloaded) {
   const now = Date.now();
   const state = await readState(env);
+  const mem = preloaded || await loadMemory(env);
   let cal = { events: [], source: "unavailable" };
   try { cal = await getCalendar(env); } catch (_) { /* optional */ }
   const pending = Array.isArray(state.pending) ? state.pending : [];
@@ -113,7 +118,7 @@ async function getCtx(env) {
     if (n.block) blocked[s] = n.reason;
   }
   return {
-    now, state, cal, pending, completed, blocked,
+    now, state, cal, pending, completed, blocked, mem,
     lastScan: state.lastScan || null,
     daily: Number(state.tracker?.daily?.[dayKey(now)] ?? 0)
   };
@@ -158,11 +163,20 @@ function detect(msg) {
   const has = (re) => re.test(t);
 
   if (has(/^\s*(hi|hello|hey|yo|good (morning|afternoon|evening))\b/) && t.split(/\s+/).length <= 4) return "greet";
+  const first = t.trim().match(/^(remember|note|learn|forget|pause|resume|unpause)\b/);
+  if (first) return first[1] === "unpause" ? "resume" : first[1];
   if (has(/\b(lot size|position size|lots?)\b/) && has(/\d/)) return "calc";
   if (has(/\bexplain\b.{0,20}\bsignal\b|\bsignal and its risks\b|\bits risks\b/)) return "explain";
   if (has(/\b(thanks|thank you|thx)\b/)) return "thanks";
   if (has(/\bwho are you\b|\bwhat are you\b/)) return "intro";
   if (has(/\b(what is|what's|what are|explain|define|meaning of|mean)\b/) && glossaryMatch(t)) return "glossary";
+  if (has(/\b(export|backup)\b.*\bbrain\b|\bbrain\b.*\b(export|backup)\b/)) return "export";
+  if (has(/\bpaused\b|\bwhich pairs are (off|paused)\b/)) return "paused";
+  if (has(/\b(my notes|notes|what do you remember|what have i taught|what did i teach)\b/)) return "notes";
+  if (has(/\b(lessons?|what have you learned|what did you learn|insights?|mistakes|weakness(es)?|how can you improve|suggestions?|learned so far)\b/)) return "lessons";
+  if (has(/\b(research now|refresh news|update news|fetch news|research the news|do research)\b/)) return "research";
+  if (has(/\b(headlines?|sentiment|what'?s happening|what is happening|latest news|market news|news (on|about|for))\b/)) return "headlines";
+  if (has(/\bwhat do you know\b|\bdo you remember\b|\bwhat did i tell you\b/)) return "know";
   if (has(/\b(performance|win rate|results?|statistics|stats|how am i doing|net r|profit|losing|losses)\b/) && !has(/\bexplain this signal\b/)) return "perf";
   if (has(/\b(news|calendar|nfp|cpi|fomc|high.impact|red folder|economic)\b/)) return "news";
   if (has(/\b(should i trade|can i trade|safe to trade|good time to trade|trade now|trade today)\b/)) return "should";
@@ -234,7 +248,13 @@ function aHelp() {
     "• news today",
     "• session / when is the next window?",
     "• what is an order block? (also sweep, BOS, FVG, premium…)",
-    "• lot size EURUSD entry 1.1000 stop 1.0980 balance 1000 risk 1%"
+    "• lot size EURUSD entry 1.1000 stop 1.0980 balance 1000 risk 1%",
+    "",
+    "I also learn and remember:",
+    "• what have you learned? (lessons from your results)",
+    "• headlines USD / news sentiment / research now",
+    "• remember: <note>   ·   learn: question => answer   ·   notes   ·   forget <id>",
+    "• pause GBPUSD / resume GBPUSD / paused"
   ].join("\n");
 }
 
@@ -249,6 +269,8 @@ function aStatus(c) {
   lines.push(`• Trades: ${act} active · ${wait} waiting · ${watch} watching`);
   const bl = Object.entries(c.blocked);
   lines.push(bl.length ? `• News pause: ${bl.map(([k, v]) => `${k} (${v})`).join("; ")}` : "• News pause: none");
+  const ps = Object.keys(c.mem.pauses || {});
+  if (ps.length) lines.push(`• Paused by you: ${ps.join(", ")}`);
   if (c.lastScan?.at) lines.push(`• Last scan: ${ago(Date.parse(c.lastScan.at))}`);
   else lines.push("• Last scan: not recorded yet");
   return lines.join("\n");
@@ -295,8 +317,16 @@ function aSignals(c, onlyBest) {
       "\nThe engine only publishes a signal when the rules line up. Waiting is a valid decision.";
   }
   const order = { ACTIVE: 0, "waiting for entry": 1, watching: 2 };
-  list = [...list].sort((a, b) => order[phaseOf(a)] - order[phaseOf(b)] || (Number(b.score) || 0) - (Number(a.score) || 0));
-  return (onlyBest ? "High-quality setups:\n" : `Current setups (${list.length}):\n`) + list.slice(0, 6).map(tradeBlock).join("\n");
+  let biased = false;
+  const rankScore = (t) => {
+    const b = pairBias(c.mem, t.symbol);
+    if (!b) return Number(t.score) || 0;
+    biased = true;
+    return (Number(t.score) || 0) + Math.max(-8, Math.min(8, b.exp * 8));
+  };
+  list = [...list].sort((a, b) => order[phaseOf(a)] - order[phaseOf(b)] || rankScore(b) - rankScore(a));
+  return (onlyBest ? "High-quality setups:\n" : `Current setups (${list.length}):\n`) + list.slice(0, 6).map(tradeBlock).join("\n") +
+    (biased ? "\n\nOrder also reflects your own past results per pair (needs 10+ trades)." : "");
 }
 
 function aScan(c) {
@@ -309,6 +339,7 @@ function aScan(c) {
   const found = [], forming = [], none = [];
   for (const s of syms) {
     const r = sum[s];
+    if (c.mem.pauses?.[s]) { none.push(`${s}: paused by you`); continue; }
     if (c.blocked[s]) { none.push(`${s}: news pause (${c.blocked[s]})`); continue; }
     if (!r) continue;
     const old = r.at && Date.now() - Date.parse(r.at) > SCAN_STALE_MIN * 60000 ? ` (as of ${ago(Date.parse(r.at))})` : "";
@@ -330,6 +361,7 @@ function aScan(c) {
 async function aAnalyse(env, c, sym, tf) {
   const open = c.pending.filter((t) => t.symbol === sym);
   const lines = [];
+  if (c.mem.pauses?.[sym]) return `${sym}\nPaused by you, so Sky is not looking for new signals on it. Say "resume ${sym}" to turn it back on.`;
   const stored = c.lastScan?.summary?.[sym];
   const at = Date.parse(stored?.at || c.lastScan?.at || "");
   const fresh = Number.isFinite(at) && Date.now() - at < SCAN_STALE_MIN * 60000;
@@ -496,14 +528,171 @@ function aGlossary(t) {
   return m ? `${m[1]}\n${m[2]}` : aHelp();
 }
 
+// ---------- learning, memory and research ----------
+const NEED_KEY = "To let me remember things or pause pairs, set a BRAIN_KEY secret in Cloudflare and put the same key in the app. That stops strangers from changing my memory.";
+
+function ccysFromText(msg) {
+  const up = msg.toUpperCase();
+  const out = new Set();
+  for (const c of ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU"]) if (new RegExp(`\\b${c}\\b`).test(up)) out.add(c);
+  const words = { DOLLAR: "USD", EURO: "EUR", POUND: "GBP", STERLING: "GBP", YEN: "JPY", AUSSIE: "AUD", KIWI: "NZD", LOONIE: "CAD", FRANC: "CHF", GOLD: "XAU" };
+  for (const [w, cc] of Object.entries(words)) if (new RegExp(`\\b${w}\\b`).test(up)) out.add(cc);
+  for (const s of findSymbols(msg)) {
+    for (const cc of symbolCurrencies(s)) out.add(cc);
+    if (s.startsWith("XAU")) out.add("XAU");
+  }
+  return [...out];
+}
+
+function aLessons(c) {
+  const ins = insights(c.mem);
+  const lines = ["What I've learned so far", ...ins.lessons.map((l) => "• " + l)];
+  if (ins.suggestions.length) lines.push("", "Suggestions (you decide):", ...ins.suggestions.map((x) => "• " + x.text));
+  const bits = [];
+  if (c.mem.notes.length) bits.push(`${c.mem.notes.length} note(s)`);
+  if (c.mem.qa.length) bits.push(`${c.mem.qa.length} Q&A`);
+  if (c.mem.research.at) bits.push(`news research ${ago(Date.parse(c.mem.research.at))}`);
+  if (bits.length) lines.push("", "Also in memory: " + bits.join(" · "));
+  lines.push("", "I learn from your closed trades and what you teach me. I never change Sky's trading rules on my own.");
+  return lines.join("\n");
+}
+
+function aHeadlines(c, msg) {
+  const r = c.mem.research;
+  if (!r.at) {
+    return 'I have not done any news research yet. Say "research now" to fetch headlines.' +
+      (r.errors?.length ? `\nLast problem: ${r.errors.join("; ")}` : "");
+  }
+  const want = ccysFromText(msg);
+  const ccys = want.length ? want
+    : Object.keys(r.tone || {}).sort((a, b) => (r.headlines[b]?.length || 0) - (r.headlines[a]?.length || 0)).slice(0, 4);
+  const lines = [`News research · updated ${ago(Date.parse(r.at))} (${r.sources} source(s))`];
+  for (const cc of ccys) {
+    const list = headlinesFor(c.mem, cc), tn = toneFor(c.mem, cc);
+    if (!list.length) { lines.push("", `${cc}: no recent headlines found.`); continue; }
+    const lean = tn ? (tn.h > tn.d ? "leaning hawkish" : tn.d > tn.h ? "leaning dovish" : "mixed") : "mixed";
+    lines.push("", `${cc} · ${lean}${tn ? ` (${tn.h} hawkish, ${tn.d} dovish, ${tn.n} neutral)` : ""}`);
+    for (const h of list.slice(0, 3)) lines.push(`• ${h.t} (${h.s})`);
+  }
+  lines.push("", "Tone is a rough keyword count, not a forecast. It does not affect trading; only the economic calendar pauses pairs.");
+  return lines.join("\n");
+}
+
+async function aResearch(env, c) {
+  const last = c.mem.research.at ? Date.parse(c.mem.research.at) : 0;
+  if (last && Date.now() - last < 10 * 60000) return `News research was refreshed ${ago(last)}. Ask for "headlines USD" to read it.`;
+  const res = await runResearch(env, c.mem, { force: true });
+  await saveMemory(env, c.mem);
+  if (res.ok) {
+    return `Done: ${res.headlines} headline(s) from ${res.sources} source(s) saved.` +
+      (res.errors.length ? `\nProblems: ${res.errors.join("; ")}` : "") + '\nAsk for "headlines USD" or "news sentiment".';
+  }
+  return `I couldn't reach any news source (${(res.errors || []).join("; ") || "no details"}). You can set a NEWS_FEEDS variable with other RSS links.`;
+}
+
+async function aRemember(env, c, msg, auth) {
+  if (!auth) return NEED_KEY;
+  const text = msg.replace(/^\s*(remember( that)?|note( that)?)\s*[:\-]?\s*/i, "").trim();
+  if (!text) return 'Tell me what to remember, for example: "remember: avoid trading gold on Fridays".';
+  const note = addNote(c.mem, text);
+  await saveMemory(env, c.mem);
+  return `Saved as ${note.id}: "${note.text}"\nSay "notes" to see everything, or "forget ${note.id}" to remove it.`;
+}
+
+async function aLearn(env, c, msg, auth) {
+  if (!auth) return NEED_KEY;
+  const body = msg.replace(/^\s*learn\s*[:\-]?\s*/i, "").trim();
+  const m = body.match(/^(.+?)\s*(?:=>|->|=)\s*([\s\S]+)$/);
+  if (!m) {
+    if (!body) return 'Teach me like this: "learn: what is my max daily loss => 3% of balance".';
+    const note = addNote(c.mem, body);
+    await saveMemory(env, c.mem);
+    return `Saved as note ${note.id}. (To teach a question and answer, use: learn: question => answer)`;
+  }
+  const item = addQa(c.mem, m[1], m[2]);
+  await saveMemory(env, c.mem);
+  return `Learned ${item.id}. If you ask "${item.q}" I will answer "${item.a}".`;
+}
+
+async function aForget(env, c, msg, auth) {
+  if (!auth) return NEED_KEY;
+  const key = msg.replace(/^\s*forget\s*[:\-]?\s*/i, "").trim();
+  if (!key) return 'Tell me what to forget: its id (like n2) or some words from it.';
+  const gone = removeKnowledge(c.mem, key);
+  if (!gone.length) return `I couldn't find anything matching "${key}". Say "notes" to see what I have.`;
+  await saveMemory(env, c.mem);
+  return `Forgot ${gone.length} item(s): ${gone.map((x) => x.id).join(", ")}.`;
+}
+
+async function aPause(env, c, msg, auth, pause) {
+  if (!auth) return NEED_KEY;
+  const syms = findSymbols(msg);
+  if (!pause && /\ball\b/i.test(msg)) {
+    resumePair(c.mem, "ALL");
+    await saveMemory(env, c.mem);
+    return "All pairs are active again.";
+  }
+  if (!syms.length) return pause ? 'Which pair? For example: "pause GBPUSD".' : 'Which pair? For example: "resume GBPUSD", or "resume all".';
+  const lines = [];
+  for (const s of syms) {
+    if (pause) { pausePair(c.mem, s); lines.push(`${s} paused. Sky will not scan it for new signals. Open trades keep running.`); }
+    else lines.push(resumePair(c.mem, s) ? `${s} is active again.` : `${s} was not paused.`);
+  }
+  await saveMemory(env, c.mem);
+  return lines.join("\n");
+}
+
+function aPaused(c) {
+  const list = Object.entries(c.mem.pauses || {});
+  if (!list.length) return "No pairs are paused.";
+  return "Paused by you:\n" + list.map(([s, p]) => `• ${s} (since ${eatDay(Date.parse(p.at))})`).join("\n") + '\nSay "resume <pair>" to turn one back on.';
+}
+
+function aNotes(c) {
+  const { notes, qa } = c.mem;
+  if (!notes.length && !qa.length) return 'I have no notes yet. Teach me with "remember: ..." or "learn: question => answer".';
+  const lines = [];
+  if (notes.length) lines.push("Notes:", ...notes.slice(-15).map((n) => `• ${n.id}: ${n.text}`));
+  if (qa.length) lines.push(...(lines.length ? [""] : []), "Q&A:", ...qa.slice(-15).map((x) => `• ${x.id}: ${x.q} → ${x.a}`));
+  return lines.join("\n");
+}
+
+function aKnow(c, msg) {
+  const q = msg.replace(/\b(what do you know( about)?|do you remember|what did i tell you( about)?)\b/gi, "").trim();
+  const hit = searchKnowledge(c.mem, q || msg);
+  if (hit) return `From what you taught me (${hit.id}):\n${hit.text}`;
+  const g = glossaryMatch(q.toLowerCase());
+  if (g) return `${g[1]}\n${g[2]}`;
+  return `I haven't been taught anything about that yet. Teach me with: remember: <fact>`;
+}
+
+function aExport(c) {
+  const m = c.mem;
+  return [
+    "My memory lives on your server, so it keeps learning even when your phone is off.",
+    "The app saves a copy on your phone about every 10 minutes, and uses it when you are offline.",
+    `• Server copy updated: ${m.updatedAt ? ago(Date.parse(m.updatedAt)) : "not saved yet"}`,
+    `• Trades learned from: ${m.stats.total.n}`,
+    `• Notes: ${m.notes.length} · Q&A: ${m.qa.length} · Paused pairs: ${Object.keys(m.pauses).length}`,
+    `• News research: ${m.research.at ? ago(Date.parse(m.research.at)) : "none yet"}`
+  ].join("\n");
+}
+
 // ---------- entry points ----------
-export async function runBrain(env, message) {
+export async function runBrain(env, message, opts = {}) {
   const msg = String(message || "").trim();
   const intent = detect(msg);
   const lower = msg.toLowerCase();
+  const auth = !!opts.auth;
+  const mem0 = await loadMemory(env);
+  // Something you taught me as "learn: question => answer" beats every built-in rule.
+  if (!["remember", "learn", "forget", "pause", "resume"].includes(intent)) {
+    const taught = searchKnowledge(mem0, msg);
+    if (taught && taught.type === "qa" && taught.score >= 0.8) return { reply: taught.text };
+  }
 
   if (intent === "greet") {
-    const c = await getCtx(env);
+    const c = await getCtx(env, mem0);
     return { reply: "Hello! I'm Sky.\n\n" + aStatus(c) + "\n\nAsk me \"help\" to see what I can do." };
   }
   if (intent === "help") return { reply: aHelp() };
@@ -511,7 +700,7 @@ export async function runBrain(env, message) {
   if (intent === "intro") return { reply: "I'm Sky's built-in brain. I read your live signals, results, scan and the economic calendar, and I answer from that data. I don't use any outside AI service, so I only say what the data shows.\n\n" + aHelp() };
   if (intent === "glossary") return { reply: aGlossary(lower) };
 
-  const c = await getCtx(env);
+  const c = await getCtx(env, mem0);
   switch (intent) {
     case "status": return { reply: aStatus(c) };
     case "should": return { reply: aShould(c) };
@@ -523,12 +712,27 @@ export async function runBrain(env, message) {
     case "session": return { reply: aSession(c) };
     case "explain": return { reply: aExplain(c, msg) };
     case "calc": return { reply: aCalc(c, msg) };
+    case "lessons": return { reply: aLessons(c) };
+    case "headlines": return { reply: aHeadlines(c, msg) };
+    case "research": return { reply: await aResearch(env, c) };
+    case "remember": return { reply: await aRemember(env, c, msg, auth) };
+    case "learn": return { reply: await aLearn(env, c, msg, auth) };
+    case "forget": return { reply: await aForget(env, c, msg, auth) };
+    case "pause": return { reply: await aPause(env, c, msg, auth, true) };
+    case "resume": return { reply: await aPause(env, c, msg, auth, false) };
+    case "paused": return { reply: aPaused(c) };
+    case "notes": return { reply: aNotes(c) };
+    case "know": return { reply: aKnow(c, msg) };
+    case "export": return { reply: aExport(c) };
     case "analyse": {
       const sym = findSymbols(msg)[0];
       return { reply: await aAnalyse(env, c, sym, findTf(msg)) };
     }
-    default:
+    default: {
+      const hit = searchKnowledge(c.mem, msg);
+      if (hit) return { reply: `From what you taught me (${hit.id}):\n${hit.text}` };
       return { reply: "I'm not sure what you mean by that. I'm a rule-based brain, so I answer best to the topics below.\n\n" + aHelp() };
+    }
   }
 }
 
@@ -546,7 +750,7 @@ export async function handleBrainChat(request, env) {
   const headers = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
   const out = (data, status = 200) => new Response(JSON.stringify(data), { status, headers });
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: { ...headers, "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } });
+    return new Response(null, { status: 204, headers: { ...headers, "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, X-Sky-Key" } });
   }
   if (request.method !== "POST") return out({ error: "Use POST" }, 405);
   let body;
@@ -555,7 +759,8 @@ export async function handleBrainChat(request, env) {
   if (!message) return out({ error: "Empty message" }, 400);
   if (!allow()) return out({ reply: "Too many messages. Please wait a minute and try again." });
   try {
-    return out(await runBrain(env, message));
+    const auth = !!env.BRAIN_KEY && request.headers.get("X-Sky-Key") === env.BRAIN_KEY;
+    return out(await runBrain(env, message, { auth }));
   } catch (e) {
     console.error("Brain error:", e);
     return out({ reply: "Something went wrong while reading the data. Please try again." });
