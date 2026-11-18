@@ -175,13 +175,18 @@ export function addNote(mem, text) {
   return note;
 }
 
-export function addQa(mem, q, a) {
-  const question = String(q || "").trim().slice(0, 200), answer = String(a || "").trim().slice(0, 400);
+const MAX_AI_QA = 40;
+
+/** src = "user" (you taught it) or "ai" (an AI service answered it first; kept so the next ask is instant). */
+export function addQa(mem, q, a, src = "user") {
+  const question = String(q || "").trim().slice(0, 200), answer = String(a || "").trim().slice(0, src === "ai" ? 700 : 400);
   if (!question || !answer) return null;
   const existing = mem.qa.find((x) => x.q.toLowerCase() === question.toLowerCase());
-  if (existing) { existing.a = answer; return existing; }
-  const item = { id: newId("q", mem.qa), q: question, a: answer, at: new Date().toISOString() };
+  if (existing) { if (src === "user" || existing.src === "ai") { existing.a = answer; existing.src = src; } return existing; }
+  const item = { id: newId("q", mem.qa), q: question, a: answer, src, at: new Date().toISOString() };
   mem.qa.push(item);
+  const ai = mem.qa.filter((x) => x.src === "ai");
+  if (ai.length > MAX_AI_QA) { const drop = ai[0].id; mem.qa = mem.qa.filter((x) => x.id !== drop); }
   return item;
 }
 
@@ -209,7 +214,7 @@ export function searchKnowledge(mem, query) {
     const it = new Set(tokens(item.q));
     const common = [...it].filter((w) => qt.has(w)).length;
     const score = common / Math.max(1, Math.min(it.size, qt.size));
-    if (common >= 1 && score >= 0.6 && (!best || score > best.score)) best = { type: "qa", text: item.a, id: item.id, score };
+    if (common >= 1 && score >= 0.6 && (!best || score > best.score)) best = { type: "qa", text: item.a, id: item.id, score, src: item.src || "user" };
   }
   if (best) return best;
   for (const n of mem.notes) {
