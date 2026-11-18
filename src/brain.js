@@ -7,7 +7,7 @@
 // ============================================================
 import { SYMBOLS } from "./market/symbols.js";
 import { getSignal } from "./engine.js";
-import { getCalendar, newsCheck, upcomingNews, symbolCurrencies } from "./agent.js";
+import { getCalendar, newsCheck, upcomingNews, symbolCurrencies, runChat } from "./agent.js";
 import {
   loadMemory, saveMemory, insights, pairBias, addNote, addQa, removeKnowledge, searchKnowledge,
   pausePair, resumePair, runResearch, headlinesFor, toneFor
@@ -163,12 +163,14 @@ function detect(msg) {
   const has = (re) => re.test(t);
 
   if (has(/^\s*(hi|hello|hey|yo|good (morning|afternoon|evening))\b/) && t.split(/\s+/).length <= 4) return "greet";
+  if (/^\s*ai\s*[:\-]\s*\S/i.test(msg)) return "ai";
   const first = t.trim().match(/^(remember|note|learn|forget|pause|resume|unpause)\b/);
   if (first) return first[1] === "unpause" ? "resume" : first[1];
   if (has(/\b(lot size|position size|lots?)\b/) && has(/\d/)) return "calc";
+  if (has(/\b(photo|picture|image|drawing|draw|annotated|marked|visual|screenshot)\b/) || has(/\b(show|send|give|open)\b.{0,15}\bchart\b|\bchart (of|for)\b/)) return "image";
   if (has(/\bexplain\b.{0,20}\bsignal\b|\bsignal and its risks\b|\bits risks\b/)) return "explain";
   if (has(/\b(thanks|thank you|thx)\b/)) return "thanks";
-  if (has(/\bwho are you\b|\bwhat are you\b/)) return "intro";
+  if (has(/\bwho are you\b|\bwhat are you\b|\byour name\b|\bwho (made|built|created) you\b/)) return "intro";
   if (has(/\b(what is|what's|what are|explain|define|meaning of|mean)\b/) && glossaryMatch(t)) return "glossary";
   if (has(/\b(export|backup)\b.*\bbrain\b|\bbrain\b.*\b(export|backup)\b/)) return "export";
   if (has(/\bpaused\b|\bwhich pairs are (off|paused)\b/)) return "paused";
@@ -238,7 +240,7 @@ function glossaryMatch(t) { return GLOSSARY.find(([re]) => re.test(t)) || null; 
 // ---------- answers ----------
 function aHelp() {
   return [
-    "I'm Sky's built-in brain. I run on your own data, with no outside AI service. Ask me things like:",
+    "I'm Sky's built-in brain. I run on your own data and work even with no outside AI. Ask me things like:",
     "• status / should I trade now?",
     "• analyse EURUSD (or gold, GBPUSD M15…)",
     "• scan all markets / why no signals?",
@@ -249,6 +251,8 @@ function aHelp() {
     "• session / when is the next window?",
     "• what is an order block? (also sweep, BOS, FVG, premium…)",
     "• lot size EURUSD entry 1.1000 stop 1.0980 balance 1000 risk 1%",
+    "• show EURUSD chart / draw the latest trade (a marked picture that explains it)",
+    "• ai: <any question>  (uses a free AI service if you connect one)",
     "",
     "I also learn and remember:",
     "• what have you learned? (lessons from your results)",
@@ -489,7 +493,7 @@ function aExplain(c, msg) {
   if (t.quality === "B-GRADE" || t.tier === "RELAXED") lines.push("• Lower-confidence (B-grade): use half your normal risk.");
   if (c.blocked[sy]) lines.push(`• High-impact news is close (${c.blocked[sy]}). Spreads and slippage can jump.`);
   lines.push("• Plan: close 50% at TP1, 30% at TP2, 20% at TP3, and move the stop to breakeven after TP1.");
-  lines.push("", "Not financial advice.");
+  lines.push("", "Not financial advice.", imgMarker(t));
   return lines.join("\n");
 }
 
@@ -653,7 +657,7 @@ function aNotes(c) {
   if (!notes.length && !qa.length) return 'I have no notes yet. Teach me with "remember: ..." or "learn: question => answer".';
   const lines = [];
   if (notes.length) lines.push("Notes:", ...notes.slice(-15).map((n) => `• ${n.id}: ${n.text}`));
-  if (qa.length) lines.push(...(lines.length ? [""] : []), "Q&A:", ...qa.slice(-15).map((x) => `• ${x.id}: ${x.q} → ${x.a}`));
+  if (qa.length) lines.push(...(lines.length ? [""] : []), "Q&A:", ...qa.slice(-15).map((x) => `• ${x.id}${x.src === "ai" ? " (AI)" : ""}: ${x.q} → ${x.a}`));
   return lines.join("\n");
 }
 
@@ -678,6 +682,46 @@ function aExport(c) {
   ].join("\n");
 }
 
+// ---------- pictures ----------
+function pickTrade(c, sym) {
+  if (sym) return c.pending.find((t) => t.symbol === sym) || c.completed.find((t) => t.symbol === sym) || null;
+  return c.pending.find((t) => !t.watch) || c.pending[0] || c.completed[0] || null;
+}
+const imgMarker = (t) => `[[IMAGE:/api/explain-image?id=${encodeURIComponent(t.id)}]]`;
+
+function aImage(c, msg) {
+  const syms = findSymbols(msg), tf = findTf(msg);
+  const t = pickTrade(c, syms[0]);
+  if (t) {
+    const state = t.result ? `closed ${t.result}` : phaseOf(t);
+    return `Here is the marked chart for ${t.symbol} ${t.direction} ${t.timeframe} (${state}).\nEvery number on the picture is explained underneath it. Pinch to zoom.\n${imgMarker(t)}`;
+  }
+  if (syms[0]) {
+    return `${syms[0]} has no trade right now, so here is its market map: structure, order blocks and the 50% line.\n[[IMAGE:/api/explain-image?symbol=${syms[0]}&tf=${tf || "M15"}]]`;
+  }
+  return 'There is no trade to draw yet. Say "show EURUSD chart" and I will draw its market map.';
+}
+
+// ---------- optional free AI helper (Gemini / Groq / Cloudflare AI) ----------
+const aiConfigured = (env) => !!(env.GEMINI_API_KEY || env.GEMINI_API_KEYS || env.GROQ_API_KEY || env.GROQ_API_KEYS || env.AI);
+// Only general "how does X work" questions are remembered. Anything about prices, today or your own data is not.
+const educational = (q) =>
+  /^(what|how|why|explain|define|difference|when|which)\b/i.test(q.trim()) && !/\d/.test(q) &&
+  !/\b(now|today|current|currently|latest|right now|price|my|mine|tonight|tomorrow)\b/i.test(q) && q.length <= 160;
+
+async function askAi(env, c, q, learn) {
+  if (!aiConfigured(env)) return null;
+  let res;
+  try { res = await runChat(env, q); } catch (_) { return null; }
+  const reply = String(res?.reply || "").trim();
+  if (!reply || /^The AI service is unavailable|^I couldn't generate/i.test(reply)) return null;
+  if (learn && educational(q)) {
+    addQa(c.mem, q, reply, "ai");   // next time the brain answers this instantly, with no AI call
+    await saveMemory(env, c.mem);
+  }
+  return reply;
+}
+
 // ---------- entry points ----------
 export async function runBrain(env, message, opts = {}) {
   const msg = String(message || "").trim();
@@ -688,7 +732,9 @@ export async function runBrain(env, message, opts = {}) {
   // Something you taught me as "learn: question => answer" beats every built-in rule.
   if (!["remember", "learn", "forget", "pause", "resume"].includes(intent)) {
     const taught = searchKnowledge(mem0, msg);
-    if (taught && taught.type === "qa" && taught.score >= 0.8) return { reply: taught.text };
+    if (taught && taught.type === "qa" && taught.score >= 0.8) {
+      return { reply: taught.text + (taught.src === "ai" ? "\n\n(From memory: first answered by an AI service, so double-check anything important.)" : "") };
+    }
   }
 
   if (intent === "greet") {
@@ -697,7 +743,7 @@ export async function runBrain(env, message, opts = {}) {
   }
   if (intent === "help") return { reply: aHelp() };
   if (intent === "thanks") return { reply: "You're welcome! Ask me anything about your setups, results or the news." };
-  if (intent === "intro") return { reply: "I'm Sky's built-in brain. I read your live signals, results, scan and the economic calendar, and I answer from that data. I don't use any outside AI service, so I only say what the data shows.\n\n" + aHelp() };
+  if (intent === "intro") return { reply: "I'm Sky's built-in brain. I read your live signals, results, scan and the economic calendar, and I answer from that data. I answer from that data first. If you connect a free AI service (Gemini or Groq), I use it only for questions I can't handle, and I remember its answers so I get faster over time.\n\n" + aHelp() };
   if (intent === "glossary") return { reply: aGlossary(lower) };
 
   const c = await getCtx(env, mem0);
@@ -724,6 +770,12 @@ export async function runBrain(env, message, opts = {}) {
     case "notes": return { reply: aNotes(c) };
     case "know": return { reply: aKnow(c, msg) };
     case "export": return { reply: aExport(c) };
+    case "image": return { reply: aImage(c, msg) };
+    case "ai": {
+      if (!aiConfigured(env)) return { reply: "No AI service is connected. Add a GEMINI_API_KEY or GROQ_API_KEY in Cloudflare to switch this on." };
+      const ans = await askAi(env, c, msg.replace(/^\s*ai\s*[:\-]\s*/i, ""), true);
+      return { reply: ans ? ans + "\n\n(answered with AI help)" : "The AI service did not answer. Please try again in a minute." };
+    }
     case "analyse": {
       const sym = findSymbols(msg)[0];
       return { reply: await aAnalyse(env, c, sym, findTf(msg)) };
@@ -731,6 +783,8 @@ export async function runBrain(env, message, opts = {}) {
     default: {
       const hit = searchKnowledge(c.mem, msg);
       if (hit) return { reply: `From what you taught me (${hit.id}):\n${hit.text}` };
+      const ans = await askAi(env, c, msg, true);
+      if (ans) return { reply: ans + "\n\n(answered with AI help)" };
       return { reply: "I'm not sure what you mean by that. I'm a rule-based brain, so I answer best to the topics below.\n\n" + aHelp() };
     }
   }
