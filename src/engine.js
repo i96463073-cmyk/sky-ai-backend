@@ -577,6 +577,21 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
 
   result.levels = { entry, stop_loss: stopLoss, take_profit: takeProfit, risk };
 
+  // What the setup was built from (times, not indexes, because indexes shift as candles roll).
+  // The marked-up chart picture draws exactly these.
+  const dispCandle = (analysis.displacement ?? []).find(x => x.index === block.displacementIndex);
+  result.evidence = {
+    event: event ? { type: event.type, direction: event.direction, time: event.time, level: finite(event.level), swingTime: event.swingTime ?? null } : null,
+    sweep: sweep ? { time: sweep.time, level: finite(sweep.level), side: sweep.side, kind: sweep.kind } : null,
+    displacement: dispCandle ? { time: dispCandle.time } : null,
+    block: { time: block.time, top: blockTop, bottom: blockBottom, status: block.status },
+    fvg: relevantFvg ? { top: finite(relevantFvg.top), bottom: finite(relevantFvg.bottom), time: relevantFvg.time } : null,
+    range: { high: finite(range.high), low: finite(range.low), equilibrium, zone: range.zone ?? null },
+    swingZone: validSD ? { price: finite(validSD.price), type: validSD.type, time: validSD.time ?? null } : null,
+    cap: nearestAny && reach < risk * TP_R_MULTIPLES[2] ? { label: nearestAny.label, price: nearestAny.price } : null,
+    atr
+  };
+
   const ordered = takeProfit.every((tp, i) =>
     (trend === "bullish" ? tp > (i ? takeProfit[i - 1] : entry) : tp < (i ? takeProfit[i - 1] : entry)));
   const sideOk = trend === "bullish" ? stopLoss < entry : stopLoss > entry;
@@ -745,7 +760,7 @@ export function evaluateWithQuota(analysis, currentPrice, options = {}, tracker 
 // ######################################################
 // PART 2: DATA, ANALYSIS AND ALL-PAIRS SCANNER
 // ######################################################
-export const ENGINE_VERSION = "3.3.0";
+export const ENGINE_VERSION = "3.4.0";
 export const DEFAULT_CANDLE_LIMIT = 300;
 const MIN_CLOSED_CANDLES = 30;
 const HTF_CANDLE_LIMIT = DEFAULT_CANDLE_LIMIT;   // same limit so higher-timeframe data is shared
