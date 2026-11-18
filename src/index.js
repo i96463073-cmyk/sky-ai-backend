@@ -384,6 +384,8 @@ function buildTrade(res, symbol, tf) {
     tier: sig.tier || res.tier || null,
     quality: sig.quality || "WATCHLIST",
     breakdown: sig.breakdown,
+    evidence: sig.evidence && typeof sig.evidence === "object" && !Array.isArray(sig.evidence) ? sig.evidence : null,
+    zone: sig.candidateZone ?? null,
     is_sd: !!sig.is_sd,
     confluence: Array.isArray(sig.confluence) ? sig.confluence : [],
     reasons: Array.isArray(sig.reasons) ? sig.reasons : [],
@@ -701,7 +703,7 @@ export default {
             entry: best.entry, stop_loss: best.stop_loss, take_profit: best.take_profit,
             confidence: best.confidence, confidence_pct: best.confidence_pct, score: best.score,
             timeframe: best.timeframe, entryStatus: best.entryStatus,
-            confluence: best.confluence, reasons: best.reasons, breakdown: best.breakdown,
+            confluence: best.confluence, reasons: best.reasons, breakdown: best.breakdown, evidence: best.evidence, zone: best.zone,
             updated_at: nowIso
           });
           continue;
