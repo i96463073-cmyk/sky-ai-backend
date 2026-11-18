@@ -139,6 +139,7 @@ export function renderExplainSvg({ symbol, tf, candles, analysis, trade, now = D
 
   const out = [];
   const badges = [];
+  const labels = [];
   const items = [];   // numbered explanations
   const badge = (x, y, k) => badges.push(
     `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="14" fill="${C.amber}" stroke="${C.bg}" stroke-width="2"/>` +
@@ -147,7 +148,7 @@ export function renderExplainSvg({ symbol, tf, candles, analysis, trade, now = D
   const tag = (y, label, fill, fg = "#fff") => {
     const yy = clampY(y);
     out.push(`<rect x="${X1 + 6}" y="${(yy - 13).toFixed(1)}" width="${W - X1 - 12}" height="26" rx="5" fill="${fill}"/>` +
-      `<text x="${(X1 + 6 + (W - X1 - 12) / 2).toFixed(1)}" y="${(yy + 6).toFixed(1)}" fill="${fg}" font-family="${FONT}" font-size="15" font-weight="700" text-anchor="middle">${esc(label)}</text>`);
+      `<text x="${(X1 + 6 + (W - X1 - 12) / 2).toFixed(1)}" y="${(yy + 6).toFixed(1)}" fill="${fg}" font-family="${FONT}" font-size="17" font-weight="700" text-anchor="middle">${esc(label)}</text>`);
   };
 
   // ---- background and grid ----
@@ -164,8 +165,8 @@ export function renderExplainSvg({ symbol, tf, candles, analysis, trade, now = D
     out.push(`<rect x="${X0}" y="${yh.toFixed(1)}" width="${X1 - X0}" height="${Math.max(0, ye - yh).toFixed(1)}" fill="${C.down}" opacity="0.07"/>`);
     out.push(`<rect x="${X0}" y="${ye.toFixed(1)}" width="${X1 - X0}" height="${Math.max(0, yl - ye).toFixed(1)}" fill="${C.up}" opacity="0.07"/>`);
     out.push(`<line x1="${X0}" y1="${ye.toFixed(1)}" x2="${X1}" y2="${ye.toFixed(1)}" stroke="${C.purpleL}" stroke-width="2" stroke-dasharray="10 7"/>`);
-    out.push(`<text x="${X0 + 8}" y="${(yh + 20).toFixed(1)}" fill="${C.down}" font-family="${FONT}" font-size="15" opacity="0.9">PREMIUM</text>`);
-    out.push(`<text x="${X0 + 8}" y="${(yl - 8).toFixed(1)}" fill="${C.up}" font-family="${FONT}" font-size="15" opacity="0.9">DISCOUNT</text>`);
+    labels.push(`<rect x="${X0 + 6}" y="${(yh + 4).toFixed(1)}" width="104" height="24" rx="5" fill="${C.bg}" opacity="0.85"/><text x="${X0 + 14}" y="${(yh + 22).toFixed(1)}" fill="${C.down}" font-family="${FONT}" font-size="16" font-weight="700">PREMIUM</text>`);
+    labels.push(`<rect x="${X0 + 6}" y="${(yl - 28).toFixed(1)}" width="112" height="24" rx="5" fill="${C.bg}" opacity="0.85"/><text x="${X0 + 14}" y="${(yl - 10).toFixed(1)}" fill="${C.up}" font-family="${FONT}" font-size="16" font-weight="700">DISCOUNT</text>`);
     tag(Y(ev.range.eq), `50% ${fx(ev.range.eq)}`, C.purple);
   }
 
@@ -287,7 +288,8 @@ export function renderExplainSvg({ symbol, tf, candles, analysis, trade, now = D
       badge(Math.min(X1 - 70, x + 30), clampY(Y(tps[0]) + (bull ? 24 : -24)), k);
       const list = tps.map((tp, i) => `TP${i + 1} ${fx(tp)} (${(Math.abs(tp - entry) / risk).toFixed(1)}R)`).join(", ");
       items.push({ n: k, title: "Targets and plan",
-        text: `${list}. Plan: close 50% at TP1, 30% at TP2 and 20% at TP3, and move the stop to breakeven after TP1 so the rest cannot lose.` });
+        text: `${list}. Plan: ${({ 1: "close everything at TP1", 2: "close 50% at TP1 and 50% at TP2", 3: "close 50% at TP1, 30% at TP2 and 20% at TP3" })[Math.min(3, tps.length)]}` +
+          `${tps.length > 1 ? ", and move the stop to breakeven after TP1 so the rest cannot lose" : ""}.` });
     }
 
     if (trade.result && closeIdx >= start) {
@@ -320,7 +322,7 @@ export function renderExplainSvg({ symbol, tf, candles, analysis, trade, now = D
   if (trade?.quality && trade.quality !== "WATCHLIST") pill(trade.quality, trade.quality === "B-GRADE" ? C.amber : trade.quality === "HIGH" ? C.up : C.purpleL);
   const sub = trade ? `${status}${Number.isFinite(createdMs) ? "  ·  opened " + eat(createdMs) : ""}` : `${status}  ·  trend ${analysis?.trend || "unknown"}`;
   head.push(`<text x="30" y="104" fill="${trade?.result ? (trade.result === "WIN" ? C.up : C.down) : C.amber}" font-family="${FONT}" font-size="22" font-weight="700">${esc(sub)}</text>`);
-  head.push(`<text x="30" y="140" fill="${C.muted}" font-family="${FONT}" font-size="17">Purple = order block   Blue = fair value gap   Amber = liquidity sweep   Green/Red = reward/risk</text>`);
+  head.push(`<text x="30" y="140" fill="${C.muted}" font-family="${FONT}" font-size="17">Purple = order block  ·  Blue = fair value gap  ·  Amber = sweep  ·  Green/Red = reward/risk</text>`);
   head.push(`<text x="30" y="172" fill="${C.muted}" font-family="${FONT}" font-size="16">${esc(`Last ${count} candles · ${String(tf || "").toUpperCase()} · prices shown to ${d} decimals`)}</text>`);
 
   // ---- numbered explanations under the chart ----
@@ -329,16 +331,16 @@ export function renderExplainSvg({ symbol, tf, candles, analysis, trade, now = D
   list.push(`<text x="30" y="${y - 12}" fill="${C.text}" font-family="${FONT}" font-size="28" font-weight="700">How to read this trade</text>`);
   y += 22;
   for (const it of items) {
-    const lines = wrap(it.text, 72);
+    const lines = wrap(it.text, 60);
     list.push(`<circle cx="46" cy="${y + 2}" r="16" fill="${C.amber}"/><text x="46" y="${y + 8}" fill="#000" font-family="${FONT}" font-size="19" font-weight="700" text-anchor="middle">${it.n}</text>`);
-    list.push(`<text x="76" y="${y + 8}" fill="${C.text}" font-family="${FONT}" font-size="23" font-weight="700">${esc(it.title)}</text>`);
-    lines.forEach((ln, i) => list.push(`<text x="76" y="${y + 40 + i * 28}" fill="${C.muted}" font-family="${FONT}" font-size="21">${esc(ln)}</text>`));
-    y += 40 + lines.length * 28 + 22;
+    list.push(`<text x="76" y="${y + 8}" fill="${C.text}" font-family="${FONT}" font-size="27" font-weight="700">${esc(it.title)}</text>`);
+    lines.forEach((ln, i) => list.push(`<text x="76" y="${y + 44 + i * 32}" fill="${C.muted}" font-family="${FONT}" font-size="24">${esc(ln)}</text>`));
+    y += 44 + lines.length * 32 + 26;
   }
   y += 6;
   list.push(`<text x="30" y="${y + 10}" fill="${C.muted}" font-family="${FONT}" font-size="16">Built from real candles and Sky's own analysis, drawn ${esc(eat(now))}. For education only, not financial advice.</text>`);
   const H = Math.ceil(y + 44);
 
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMin meet">` +
-    `<rect width="${W}" height="${H}" fill="${C.bg}"/>` + head.join("") + out.join("") + badges.join("") + list.join("") + `</svg>`;
+    `<rect width="${W}" height="${H}" fill="${C.bg}"/>` + head.join("") + out.join("") + labels.join("") + badges.join("") + list.join("") + `</svg>`;
 }
