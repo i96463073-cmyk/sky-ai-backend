@@ -3,8 +3,9 @@ import { getMarketData, assessFreshness, isMarketClosed } from "./market/biquote
 import { analyze } from "./smc/analyze.js";
 import { ENGINE_VERSION, getClosedCandles, getSignal } from "./engine.js";
 import { loadMemory, exportBrain } from "./memory.js";
+import { renderExplainSvg } from "./chartimage.js";
 
-export const API_VERSION = "signals-api-0.6.0";
+export const API_VERSION = "signals-api-0.7.0";
 
 // "Signals today" counter. Must match the engine's daily target and day boundary (EAT).
 const DAILY_TARGET = 3;
@@ -18,6 +19,16 @@ function dayKey(ms) {
 }
 
 const MIN_CLOSED_CANDLES = 30;
+
+// Picture requests are heavy (they fetch candles and run the analysis), so cap them per Worker instance.
+const imageHits = [];
+function allowImage() {
+  const now = Date.now();
+  while (imageHits.length && now - imageHits[0] > 60000) imageHits.shift();
+  if (imageHits.length >= 12) return false;
+  imageHits.push(now);
+  return true;
+}
 
 // Set an ALLOWED_ORIGIN variable (e.g. https://your-dashboard.pages.dev) to stop other
 // websites from reading your signals. If it is not set, any site can read them ("*").
@@ -179,6 +190,35 @@ export async function handleApi(request, env = {}) {
     } catch (e) {
       return fail(500, "CHART_FAIL", String(e?.message || e));
     }
+  }
+
+  // Marked-up, explained trade picture (SVG). /api/explain-image?id=<trade id>  or  ?symbol=EURUSD&tf=M15 for a market map.
+  if (url.pathname === "/api/explain-image") {
+    if (!env.SKY_MEMORY) return fail(500, "NO_DB", "Database not configured");
+    if (!allowImage()) return fail(429, "RATE_LIMIT", "Too many pictures requested. Please wait a minute.");
+    const id = url.searchParams.get("id");
+    let trade = null;
+    if (id) {
+      let st = {};
+      try { st = JSON.parse((await env.SKY_MEMORY.get("app_state")) || "{}") || {}; } catch (_) { /* ignore */ }
+      trade = [...(st.pending || []), ...(st.completed || [])].find((t) => t.id === id) || null;
+      if (!trade) return fail(404, "NO_TRADE", "That trade is no longer stored (only the latest closed trades are kept).");
+    }
+    const symbol = String(trade?.symbol || url.searchParams.get("symbol") || "").toUpperCase();
+    const tfKey = String(trade?.timeframe || url.searchParams.get("tf") || url.searchParams.get("timeframe") || "M15").toUpperCase();
+    if (!SYMBOLS[symbol] || !TIMEFRAMES[tfKey]) return fail(400, "BAD_PARAMS", "Invalid symbol or timeframe");
+    let payload;
+    try {
+      payload = await getSignal(env, symbol, tfKey);
+    } catch (e) {
+      return fail(500, "IMAGE_FAIL", String(e?.message || e));
+    }
+    if (!payload?.ok || !payload.market?.candles?.length) {
+      const why = typeof payload?.error === "string" ? payload.error : payload?.error?.message || "market data unavailable";
+      return fail(502, "DATA_FAIL", `Could not load candles: ${why}`);
+    }
+    const svg = renderExplainSvg({ symbol, tf: tfKey, candles: payload.market.candles, analysis: payload.analysis, trade, now: Date.now() });
+    return new Response(svg, { status: 200, headers: { ...HEADERS, "Content-Type": "image/svg+xml; charset=UTF-8", "Cache-Control": "no-store" } });
   }
 
   // Read-only snapshot of what the brain has learned. The app saves a copy on the phone.
