@@ -3,7 +3,7 @@ import { getMarketData, assessFreshness, isMarketClosed } from "./market/biquote
 import { analyze } from "./smc/analyze.js";
 import { ENGINE_VERSION, getClosedCandles, getSignal } from "./engine.js";
 import { loadMemory, exportBrain } from "./memory.js";
-import { renderExplainSvg } from "./chartimage.js";
+import { renderExplainSvg } from "./Chartimage.js";
 
 export const API_VERSION = "signals-api-0.7.0";
 
