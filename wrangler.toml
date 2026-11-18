@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2024-03-01"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "7 * * * *"]
 
 [[kv_namespaces]]
 binding = "SKY_MEMORY"
