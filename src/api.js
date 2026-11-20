@@ -3,9 +3,10 @@ import { getMarketData, assessFreshness, isMarketClosed } from "./market/biquote
 import { analyze } from "./smc/analyze.js";
 import { ENGINE_VERSION, getClosedCandles, getSignal } from "./engine.js";
 import { loadMemory, exportBrain } from "./memory.js";
-import { renderExplainSvg } from "./Chartimage.js";
+import { renderExplainSvg } from "./chartimage.js";
+import { plainReason } from "./analyst.js";
 
-export const API_VERSION = "signals-api-0.7.0";
+export const API_VERSION = "signals-api-0.8.0";
 
 // "Signals today" counter. Must match the engine's daily target and day boundary (EAT).
 const DAILY_TARGET = 3;
@@ -217,7 +218,13 @@ export async function handleApi(request, env = {}) {
       const why = typeof payload?.error === "string" ? payload.error : payload?.error?.message || "market data unavailable";
       return fail(502, "DATA_FAIL", `Could not load candles: ${why}`);
     }
-    const svg = renderExplainSvg({ symbol, tf: tfKey, candles: payload.market.candles, analysis: payload.analysis, trade, now: Date.now() });
+    const sg = payload.signal || {};
+    const verdict = (sg.decision === "BUY" || sg.decision === "SELL") ? `Sky sees a ${sg.decision} setup (score ${sg.score}). `
+      : sg.watch ? "A setup is forming. " : "NO TRADE. ";
+    const svg = renderExplainSvg({
+      symbol, tf: tfKey, candles: payload.market.candles, analysis: payload.analysis, trade, now: Date.now(),
+      verdict: verdict + plainReason((sg.reasons || []).at(-1)), htf: payload.htf?.trend || null
+    });
     return new Response(svg, { status: 200, headers: { ...HEADERS, "Content-Type": "image/svg+xml; charset=UTF-8", "Cache-Control": "no-store" } });
   }
 
