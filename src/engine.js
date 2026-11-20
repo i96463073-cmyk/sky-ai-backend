@@ -565,11 +565,12 @@ export function evaluateSetup(analysis, currentPrice, options = {}) {
   }
 
   const takeProfit = [];
+  const minGap = risk * 0.5;   // targets closer together than half the risk are just noise, so they are dropped
   for (const r of TP_R_MULTIPLES) {
     const d = Math.min(risk * r, reach);
     const tp = entry + dir * d;
     const prev = takeProfit[takeProfit.length - 1];
-    if (prev === undefined || Math.abs(tp - prev) > 1e-9) takeProfit.push(tp);
+    if (prev === undefined || Math.abs(tp - prev) >= minGap) takeProfit.push(tp);
   }
   if (reach < risk * TP_R_MULTIPLES[2]) {
     result.confluence.push(`TPs capped at ${nearestAny.label}`);
@@ -760,7 +761,7 @@ export function evaluateWithQuota(analysis, currentPrice, options = {}, tracker 
 // ######################################################
 // PART 2: DATA, ANALYSIS AND ALL-PAIRS SCANNER
 // ######################################################
-export const ENGINE_VERSION = "3.4.0";
+export const ENGINE_VERSION = "3.4.1";
 export const DEFAULT_CANDLE_LIMIT = 300;
 const MIN_CLOSED_CANDLES = 30;
 const HTF_CANDLE_LIMIT = DEFAULT_CANDLE_LIMIT;   // same limit so higher-timeframe data is shared
