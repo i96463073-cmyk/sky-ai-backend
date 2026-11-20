@@ -228,7 +228,7 @@ function digitsFor(symbol) {
   return 5;
 }
 
-async function buildChatContext(env) {
+export async function buildChatContext(env) {
   const state = await readState(env);
   const now = Date.now();
   const lines = [];
@@ -268,7 +268,15 @@ async function buildChatContext(env) {
   return lines.join("\n").slice(0, 3500);
 }
 
-export async function runChat(env, userMessage) {
+/** Free-form AI call used by the analyst brain. Returns the text, or null if no provider answered. */
+export async function askAI(env, { messages, temperature = 0.3, maxTokens = 700 }) {
+  const r = await callAI(env, { messages, temperature, maxTokens });
+  if (!r.ok) return null;
+  const text = String(r.message?.content || "").trim();
+  return text || null;
+}
+
+export async function runChat(env, userMessage, history = []) {
   const context = await buildChatContext(env);
   const system = `You are Sky AI, the assistant inside a Smart Money Concepts (SMC) forex and gold signals app.
 Current time: ${new Date().toUTCString()}.
@@ -280,7 +288,9 @@ APP DATA
 ${context}`;
 
   const r = await callAI(env, {
-    messages: [{ role: "system", content: system }, { role: "user", content: userMessage }],
+    messages: [{ role: "system", content: system },
+      ...(history || []).slice(-6).map((h) => ({ role: h.role === "assistant" ? "assistant" : "user", content: String(h.content || "").slice(0, 700) })),
+      { role: "user", content: userMessage }],
     temperature: 0.3,
     maxTokens: 600
   });
