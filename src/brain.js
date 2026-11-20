@@ -7,7 +7,8 @@
 // ============================================================
 import { SYMBOLS } from "./market/symbols.js";
 import { getSignal } from "./engine.js";
-import { getCalendar, newsCheck, upcomingNews, symbolCurrencies, runChat } from "./agent.js";
+import { getCalendar, newsCheck, upcomingNews, symbolCurrencies, runChat, askAI, buildChatContext } from "./agent.js";
+import { fetchBrief, ruleReport, reasoningMessages, plainReason } from "./analyst.js";
 import {
   loadMemory, saveMemory, insights, pairBias, addNote, addQa, removeKnowledge, searchKnowledge,
   pausePair, resumePair, runResearch, headlinesFor, toneFor
@@ -90,9 +91,15 @@ function findSymbols(text) {
   return found.sort((a, b) => a.pos - b.pos).map((f) => f.s);
 }
 function findTf(text) {
-  const m = text.toLowerCase().match(/\b(m5|5m|m15|15m|h1|1h|h4|4h)\b/);
-  if (!m) return null;
-  return { "5m": "M5", m5: "M5", "15m": "M15", m15: "M15", "1h": "H1", h1: "H1", "4h": "H4", h4: "H4" }[m[1]];
+  const t = text.toLowerCase();
+  const direct = t.match(/\b(m5|m15|m30|h1|h4)\b/);
+  if (direct) return direct[1].toUpperCase();
+  let m = t.match(/(\d+)\s*(?:m|min|mins|minute|minutes)\b/);
+  if (m) { const v = Number(m[1]); if (v === 5) return "M5"; if (v === 15) return "M15"; if (v === 30) return "M30"; }
+  m = t.match(/(\d+)\s*(?:h|hr|hrs|hour|hours)\b/);
+  if (m) { const v = Number(m[1]); if (v === 1) return "H1"; if (v === 4) return "H4"; }
+  if (/\bhourly\b/.test(t)) return "H1";
+  return null;
 }
 const digits = (s) => (String(s).startsWith("XAU") ? 2 : String(s).endsWith("JPY") ? 3 : 5);
 const pipSize = (s) => (String(s).includes("JPY") ? 0.01 : String(s).includes("XAU") ? 0.1 : 0.0001);
@@ -126,35 +133,8 @@ async function getCtx(env, preloaded) {
 
 const phaseOf = (t) => (t.watch ? "watching" : t.entered ? "ACTIVE" : "waiting for entry");
 
-// ---------- plain-language reasons ----------
-const REASONS = [
-  [/outside prime|not allowed in|session .* not allowed/i, "It's outside the trading windows (London and New York open)."],
-  [/higher-timeframe trend unavailable/i, "The higher timeframe has no clear trend, or its data could not be loaded."],
-  [/conflicts with HTF/i, "The trend on this timeframe disagrees with the higher timeframe."],
-  [/no recent BOS/i, "There has been no fresh break of structure in the trend direction."],
-  [/no recent liquidity sweep/i, "No liquidity sweep has happened before the move yet."],
-  [/events out of order/i, "The sequence (sweep, then structure break, then order block) is not in the right order."],
-  [/no fresh unmitigated order block|no fresh/i, "There is no fresh order block near price. Price is either far from one or the block was already used."],
-  [/premium half/i, "Price is in the premium half of the range, so buys are not allowed here."],
-  [/discount half/i, "Price is in the discount half of the range, so sells are not allowed here."],
-  [/dealing range/i, "There is no usable price range yet to judge premium/discount."],
-  [/below the .* minimum/i, "A setup exists but its score is too low to qualify."],
-  [/obstacle|sits between entry and TP1/i, "A nearby level leaves too little room to the first target."],
-  [/stop is .* ATR/i, "The stop would need to be too wide to be safe."],
-  [/waiting for price to retest/i, "A setup is forming. Price has not reached the order block yet."],
-  [/stronger confirming candle|waiting for a confirming/i, "Price is at the order block. Sky is waiting for a strong confirming candle."],
-  [/stale/i, "Market data is stale, so signals are paused for safety."],
-  [/exposure|same-side trades/i, "Blocked to avoid stacking too many trades on one currency."],
-  [/cooldown/i, "This setup already produced a signal recently."],
-  [/already has an active trade/i, "This pair already has an open trade."],
-  [/Filters passed/i, "All filters passed and the entry candle confirmed."],
-  [/market structure is neutral|neutral/i, "The market has no clear trend right now."]
-];
-function plain(reason) {
-  const r = String(reason || "");
-  for (const [re, text] of REASONS) if (re.test(r)) return text;
-  return r.replace(/^Rejected:\s*/i, "") || "No reason recorded.";
-}
+// ---------- plain-language reasons (shared with the analyst and the pictures) ----------
+const plain = plainReason;
 
 // ---------- intents ----------
 function detect(msg) {
@@ -186,6 +166,7 @@ function detect(msg) {
   if (has(/\bhow many\b|\btoday\b|\bquota\b|\bdaily\b/) && has(/signal/)) return "status";
   if (has(/\bscan\b|all (markets|pairs)|every pair|rank them/) || syms.length >= 3) return "scan";
   if (has(/high.quality|best setup|top setup|strongest|best trade/)) return "best";
+  if (syms.length && has(/\b(should i|can i|worth|good (buy|sell|trade)|what do you think|your (view|opinion)|outlook|bias|forecast|going (up|down)|next move|buy or sell|long or short|compare|versus|vs)\b/)) return "analyse";
   if (has(/\b(analy[sz]e|analysis|structure|chart|why|check|what about|how is|how's|look at)\b/) && syms.length) return "analyse";
   if (has(/\b(no signals?|why no|why aren't|why isn't|nothing)\b/)) return "scan";
   if (has(/\b(signals?|setups?|trades?|active|open|waiting|watch(list)?|positions?)\b/)) return "signals";
@@ -682,6 +663,38 @@ function aExport(c) {
   ].join("\n");
 }
 
+// ---------- the analyst ----------
+function lastSymbol(history) {
+  for (let i = (history || []).length - 1; i >= 0; i--) {
+    const s = findSymbols(String(history[i].content || ""))[0];
+    if (s) return s;
+  }
+  return null;
+}
+
+async function aAnalyst(env, c, msg, syms, tf, history) {
+  const got = [];
+  const failed = [];
+  for (const s of syms) {
+    const r = await fetchBrief(env, s, tf);
+    if (r.ok) got.push({ s, brief: r.brief }); else failed.push(`${s} ${tf}: ${r.error}`);
+  }
+  if (!got.length) {
+    // live data unavailable: fall back to what the last scan recorded
+    return `I couldn't load live ${tf} data (${failed.join("; ")}).\n\n` + await aAnalyse(env, c, syms[0], null);
+  }
+  const hint = `\n\nSay "show ${got[0].s} chart" for a marked picture.`;
+  if (aiConfigured(env)) {
+    try {
+      const appCtx = await buildChatContext(env);
+      const text = await askAI(env, { messages: reasoningMessages(got.map((g) => g.brief), msg, appCtx, history), temperature: 0.3, maxTokens: 800 });
+      if (text) return text + (failed.length ? `\n\n(Could not load: ${failed.join("; ")})` : "") + "\n\n(AI reasoning on live data)" + hint;
+    } catch (_) { /* fall through to the built-in report */ }
+  }
+  const extras = (s) => ({ blocked: c.blocked[s] || null, open: c.pending.filter((t) => t.symbol === s), paused: !!c.mem.pauses?.[s] });
+  return got.map((g) => ruleReport(g.brief, extras(g.s))).join("\n\n— — —\n\n") + (failed.length ? `\n\n(Could not load: ${failed.join("; ")})` : "") + hint;
+}
+
 // ---------- pictures ----------
 function pickTrade(c, sym) {
   if (sym) return c.pending.find((t) => t.symbol === sym) || c.completed.find((t) => t.symbol === sym) || null;
@@ -709,13 +722,13 @@ const educational = (q) =>
   /^(what|how|why|explain|define|difference|when|which)\b/i.test(q.trim()) && !/\d/.test(q) &&
   !/\b(now|today|current|currently|latest|right now|price|my|mine|tonight|tomorrow)\b/i.test(q) && q.length <= 160;
 
-async function askAi(env, c, q, learn) {
+async function askAi(env, c, q, learn, history = []) {
   if (!aiConfigured(env)) return null;
   let res;
-  try { res = await runChat(env, q); } catch (_) { return null; }
+  try { res = await runChat(env, q, history); } catch (_) { return null; }
   const reply = String(res?.reply || "").trim();
   if (!reply || /^The AI service is unavailable|^I couldn't generate/i.test(reply)) return null;
-  if (learn && educational(q)) {
+  if (learn && educational(q) && !(history || []).length) {
     addQa(c.mem, q, reply, "ai");   // next time the brain answers this instantly, with no AI call
     await saveMemory(env, c.mem);
   }
@@ -725,9 +738,16 @@ async function askAi(env, c, q, learn) {
 // ---------- entry points ----------
 export async function runBrain(env, message, opts = {}) {
   const msg = String(message || "").trim();
-  const intent = detect(msg);
+  let intent = detect(msg);
   const lower = msg.toLowerCase();
   const auth = !!opts.auth;
+  const history = opts.history || [];
+  // With an AI connected, open-ended questions that only matched a weak keyword ("is the stop on this trade
+  // too tight?") go to the AI instead of a fixed list.
+  if (aiConfigured(env) && ["signals", "status", "session"].includes(intent) && msg.split(/\s+/).length >= 6 &&
+      (/\?/.test(msg) || /^(is|are|does|do|can|could|should|would|how|why|what|when|which|explain)\b/i.test(msg))) intent = "ai";
+  // follow-up such as "what about 4 hour?" keeps talking about the last pair
+  if (intent === "unknown" && !findSymbols(msg).length && findTf(msg) && lastSymbol(history)) intent = "analyse";
   const mem0 = await loadMemory(env);
   // Something you taught me as "learn: question => answer" beats every built-in rule.
   if (!["remember", "learn", "forget", "pause", "resume"].includes(intent)) {
@@ -773,17 +793,19 @@ export async function runBrain(env, message, opts = {}) {
     case "image": return { reply: aImage(c, msg) };
     case "ai": {
       if (!aiConfigured(env)) return { reply: "No AI service is connected. Add a GEMINI_API_KEY or GROQ_API_KEY in Cloudflare to switch this on." };
-      const ans = await askAi(env, c, msg.replace(/^\s*ai\s*[:\-]\s*/i, ""), true);
+      const ans = await askAi(env, c, msg.replace(/^\s*ai\s*[:\-]\s*/i, ""), true, history);
       return { reply: ans ? ans + "\n\n(answered with AI help)" : "The AI service did not answer. Please try again in a minute." };
     }
     case "analyse": {
-      const sym = findSymbols(msg)[0];
-      return { reply: await aAnalyse(env, c, sym, findTf(msg)) };
+      let syms = findSymbols(msg).slice(0, 2);
+      if (!syms.length) { const hs = lastSymbol(history); if (hs) syms = [hs]; }
+      if (!syms.length) return { reply: 'Which pair should I analyse? For example: "analyse gold on 1 hour".' };
+      return { reply: await aAnalyst(env, c, msg, syms, findTf(msg) || "M15", history) };
     }
     default: {
       const hit = searchKnowledge(c.mem, msg);
       if (hit) return { reply: `From what you taught me (${hit.id}):\n${hit.text}` };
-      const ans = await askAi(env, c, msg, true);
+      const ans = await askAi(env, c, msg, true, history);
       if (ans) return { reply: ans + "\n\n(answered with AI help)" };
       return { reply: "I'm not sure what you mean by that. I'm a rule-based brain, so I answer best to the topics below.\n\n" + aHelp() };
     }
@@ -812,9 +834,12 @@ export async function handleBrainChat(request, env) {
   const message = String(body?.message ?? "").trim().slice(0, 1000);
   if (!message) return out({ error: "Empty message" }, 400);
   if (!allow()) return out({ reply: "Too many messages. Please wait a minute and try again." });
+  const history = Array.isArray(body?.history)
+    ? body.history.slice(-8).map((h) => ({ role: h?.role === "assistant" ? "assistant" : "user", content: String(h?.content ?? "").slice(0, 700) }))
+    : [];
   try {
     const auth = !!env.BRAIN_KEY && request.headers.get("X-Sky-Key") === env.BRAIN_KEY;
-    return out(await runBrain(env, message, { auth }));
+    return out(await runBrain(env, message, { auth, history }));
   } catch (e) {
     console.error("Brain error:", e);
     return out({ reply: "Something went wrong while reading the data. Please try again." });
