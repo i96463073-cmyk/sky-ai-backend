@@ -61,7 +61,8 @@ export function buildBrief(symbol, tf, payload) {
     trend: a.trend || "unknown", higherTimeframe: payload.htf?.timeframe || null, higherTimeframeTrend: payload.htf?.trend || null,
     session: sig.session || null,
     range: rg ? {
-      low: r(rg.low), high: r(rg.high), equilibrium: r(rg.equilibrium), zone: rg.zone || null,
+      low: r(rg.low), high: r(rg.high), equilibrium: r(rg.equilibrium),
+      zone: rg.zone || (price === null ? null : price > rg.equilibrium ? "premium" : price < rg.equilibrium ? "discount" : "equilibrium"),
       positionPercent: rg.high > rg.low && price !== null ? Math.round(((price - rg.low) / (rg.high - rg.low)) * 100) : null
     } : null,
     structure: (a.structureEvents || []).slice(-3).map((e) => ({ type: e.type, direction: e.direction, level: r(e.level), candlesAgo: ago(e.index) })),
